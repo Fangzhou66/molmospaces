@@ -122,7 +122,19 @@ class EvalTaskSampler(PickTaskSampler):
                 .get("joints", {})
                 .get(joint_name, None)
             )
-            if get_joint_grasp_path(thor_object_name, thor_joint_name) is not None:
+            # Pass grasp_libraries (mirrors json_eval_task_sampler.py / 9bf7ee7).
+            # thor ARTICULATED objects are deliberately not uid-indexable
+            # (grasps.py:78-82), so _filter_grasp_libraries_for_object(uid, None)
+            # returns [] and the on-disk droid joint-grasp is never consulted. With
+            # grasp_libraries=["droid"] (len==1) get_joint_grasp_path skips the uid
+            # filter and resolves grasps/droid/{asset_id}/{joint}_grasps_filtered.npz.
+            if get_joint_grasp_path(
+                thor_object_name,
+                thor_joint_name,
+                grasp_libraries=getattr(
+                    self.config.task_sampler_config, "grasp_libraries", None
+                ),
+            ) is not None:
                 joint_names_with_grasp_file.append(joint_name)
         if len(joint_names_with_grasp_file) == 0:
             raise ValueError(f"No joints with grasp file found for {pickup_obj.name}")
