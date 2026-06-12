@@ -40,6 +40,64 @@ MJC_VERSION = tuple(map(int, mujoco.__version__.split(".")))
 FILAMENT_ATTR_ENV_LIGHT_INTENSITY = "filament.fallback.environment_light_intensity"
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _env_creation_lock():
+    """Cooperative inter-process gate around CPUMujocoEnv creation.
+
+    Filament/Vulkan context creation (~7-10s of driver-global work inside
+    FilamentContext::Init) degrades EVERY process's render path when many
+    creations run concurrently (NVIDIA RM lock convoy; same finding as
+    alice's _filament_reset_lock, commit 3857f4f, and the 2026-06-12 datagen
+    diagnosis wf_909c88f7: 16 workers ~1.0s/step vs 48-88 workers 7.5-12s/step
+    with idle CPU+GPU). Default OFF: set MS_FIL_CTX_LOCK_PATH to enable —
+    typically one lock file per GPU so shards pinned to different devices
+    don't gate each other. MS_FIL_CTX_LOCK_K (default 1) allows up to K
+    concurrent creations via K flock slot files. flock is released by the
+    kernel on process death — crash-safe by construction.
+    """
+    base = os.environ.get("MS_FIL_CTX_LOCK_PATH")
+    if not base:
+        yield
+        return
+    import fcntl
+    import time as _time
+
+    k = max(1, int(os.environ.get("MS_FIL_CTX_LOCK_K", "1")))
+    lock_dir = os.path.dirname(base)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    slots = [f"{base}.{i}" for i in range(k)]
+    files = [open(p, "w") for p in slots]
+    held = None
+    try:
+        start = _time.monotonic()
+        while held is None:
+            for f in files:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = f
+                    break
+                except OSError:
+                    continue
+            if held is None:
+                _time.sleep(0.25)
+        waited = _time.monotonic() - start
+        if waited > 1.0:
+            log.info(
+                f"env-creation lock: waited {waited:.1f}s "
+                f"(pid={os.getpid()} k={k})"
+            )
+        yield
+    finally:
+        if held is not None:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        for f in files:
+            f.close()
+
+
 # Asset blacklist for data generation - assets that cause consistent failures
 # Use environment variable if set (for distributed jobs with read-only code mounts)
 # Otherwise fall back to local path in the codebase
@@ -788,12 +846,13 @@ class BaseMujocoTaskSampler:
         # Track environment creation time
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_env_create")
-        self._env = CPUMujocoEnv(
-            self.config,
-            robot_factory=self._create_robot,
-            mj_model=model,
-            mj_base_scene_path=scene_path,
-        )
+        with _env_creation_lock():
+            self._env = CPUMujocoEnv(
+                self.config,
+                robot_factory=self._create_robot,
+                mj_model=model,
+                mj_base_scene_path=scene_path,
+            )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")
 
