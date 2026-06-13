@@ -1225,8 +1225,15 @@ def get_core_sensors(exp_config):
     sensors.append(LastCommandedEETwistSensor())
     sensors.append(LastCommandedEEPoseSensor())
 
-    # Object tracking sensors
-    sensors.append(ObjectImagePointsSensor(exp_config=exp_config))
+    # Object tracking sensors. Render diet: the seg-render point sensor defaults
+    # to ALL config cameras (camera_names=None) and is the largest un-dieted
+    # per-step lock consumer; restrict it to the kept set so it renders only the
+    # 2 streams the SFT conversion consumes. _keep is None when the diet is off
+    # (byte-identical: None -> all cameras).
+    sensors.append(ObjectImagePointsSensor(
+        exp_config=exp_config,
+        camera_names=(sorted(_keep) if _keep is not None else None),
+    ))
 
     return sensors
 

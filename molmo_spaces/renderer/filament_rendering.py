@@ -6,6 +6,15 @@ import numpy as np
 from molmo_spaces.env.mj_extensions import MjModelBindings
 from molmo_spaces.renderer.abstract_renderer import MjAbstractRenderer
 
+import os as _os
+# Datagen render-diet only: the upstream plain-RGB path does a redundant 2nd
+# mjr_readPixels (commit 5b643a3). It is byte-identical -- one read already runs
+# the full beginFrame->render->ReadColorPixels->endFrame->flushAndWait pipeline,
+# so the 2nd is a wasted GPU->host readback under the contended per-GPU RM lock.
+# Gated on MS_RENDER_KEEP_CAMERAS so DEFAULT / RL behaviour stays byte-identical
+# to upstream (double read); only diet datagen workers drop the duplicate.
+_MS_RENDER_DIET = _os.environ.get("MS_RENDER_KEEP_CAMERAS") is not None
+
 
 def prepare_locals_for_super(
     local_vars, args_name="args", kwargs_name="kwargs", ignore_kwargs=False
@@ -223,7 +232,8 @@ class MjFilamentRenderer(MjAbstractRenderer):
             np.copyto(self._scene.flags, original_flags)
         else:
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
-            mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
+            if not _MS_RENDER_DIET:
+                mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
 
         return out
 
@@ -283,7 +293,8 @@ class MjFilamentRenderer(MjAbstractRenderer):
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
         else:
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
-            mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
+            if not _MS_RENDER_DIET:
+                mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
 
         return out
 
