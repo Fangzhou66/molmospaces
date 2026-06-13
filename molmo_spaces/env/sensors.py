@@ -1110,9 +1110,28 @@ def get_core_sensors(exp_config):
     """
     sensors = []
 
+    # Env-gated render diet (default off): build per-step CameraSensors for ONLY
+    # the named cameras. Renders are the filament per-step bottleneck and the SFT
+    # omni-fixed conversion consumes just droid_shoulder_light_randomization +
+    # wrist_camera_zed_mini, so skipping the unused zed2/gopro/depth streams cuts
+    # per-step render work ~3x. This is the get_core_sensors seam (built AFTER
+    # robot placement) and it does NOT mutate camera_config, so the placement
+    # visibility check still sees ALL cameras -> robot-pose distribution is
+    # byte-identical (strict alignment). Spawned workers inherit the env var.
+    import os as _os
+    _keep_env = _os.environ.get("MS_RENDER_KEEP_CAMERAS")
+    _all_cam_names = {c.name for c in exp_config.camera_config.cameras}
+    _keep = ({n.strip() for n in _keep_env.split(",") if n.strip()}
+             if _keep_env else None)
+    if _keep is not None and not (_keep & _all_cam_names):
+        _keep = None  # never prune to empty: ignore a keep-set matching nothing
+
     # Get camera names dynamically from camera config instead of hardcoded list
     for camera_spec in exp_config.camera_config.cameras:
         camera_name = camera_spec.name
+
+        if _keep is not None and camera_name not in _keep:
+            continue  # render diet: no per-step sensors for this camera
 
         # Camera parameter sensor
         cam_params = CameraParameterSensor(
