@@ -1,5 +1,6 @@
 import gc
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -178,21 +179,28 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
     def _initialize_with_model(self, mj_model: MjModel, mj_base_scene_path: str) -> None:
         """Initialize the environment with a MuJoCo model."""
+        init_t0 = time.monotonic()
+
         # Clean up old renderer if it exists (important for GPU texture cleanup when loading new scenes)
+        close_t0 = time.monotonic()
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+        close_s = time.monotonic() - close_t0
 
         # Invalidate cached thormap when scene changes
         self._cached_thormap = None
         self._cached_thormap_key = None
 
         # scenes
+        metadata_t0 = time.monotonic()
         self._mj_model = mj_model
         self._mj_base_scene_path = mj_base_scene_path
         self._scene_metadata = get_scene_metadata(mj_base_scene_path)
+        metadata_s = time.monotonic() - metadata_t0
 
         # data for each batch
+        data_settle_t0 = time.monotonic()
         self._mj_datas = [MjData(mj_model) for _ in range(self._n_batch)]
         for mj_data in self._mj_datas:
             mujoco.mj_forward(mj_model, mj_data)
@@ -200,7 +208,11 @@ class CPUMujocoEnv(BaseMujocoEnv):
                 self.config.task_sampler_config.sim_settle_timesteps
             ):  # let objects settle
                 mujoco.mj_step(mj_model, mj_data)
+        data_settle_s = time.monotonic() - data_settle_t0
+
+        robot_t0 = time.monotonic()
         self._robots = tuple(self._robot_factory(mj_data) for mj_data in self._mj_datas)
+        robot_s = time.monotonic() - robot_t0
 
         # Initialize the single renderer
         # TODO HERE: need to set devices here
@@ -209,23 +221,50 @@ class CPUMujocoEnv(BaseMujocoEnv):
             width, height = self.config.camera_config.img_resolution
         else:
             width, height = (640, 480)  # Default resolution
+        renderer_t0 = time.monotonic()
         if HAS_FILAMENT:
             log.info("Using MuJoCo renderer: filament")
             self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
         else:
             log.info("Using MuJoCo renderer: classic")
             self._renderer = MjOpenGLRenderer(model=self.mj_model, width=width, height=height)
+        renderer_s = time.monotonic() - renderer_t0
 
+        executor_t0 = time.monotonic()
         if self._parallelize and self._n_batch > 1:
             self._executor = ThreadPoolExecutor(max_workers=self._n_batch)
         else:
             self._executor = None
+        executor_s = time.monotonic() - executor_t0
 
         # For now, instantiate a new ObjectManager per data
         from molmo_spaces.env.object_manager import ObjectManager
 
+        object_manager_t0 = time.monotonic()
         for idx in range(len(self._mj_datas)):
             self.object_managers.append(ObjectManager(self, idx))
+        object_manager_s = time.monotonic() - object_manager_t0
+
+        if HAS_FILAMENT:
+            total_s = time.monotonic() - init_t0
+            cpu_pre_renderer_s = close_s + metadata_s + data_settle_s + robot_s
+            log.info(
+                "MS_FILAMENT_ENV_INIT_TIMING path=%s total_s=%.3f "
+                "cpu_pre_renderer_s=%.3f close_s=%.3f metadata_s=%.3f "
+                "data_settle_s=%.3f robot_s=%.3f renderer_total_s=%.3f "
+                "executor_s=%.3f object_manager_s=%.3f n_batch=%d",
+                mj_base_scene_path,
+                total_s,
+                cpu_pre_renderer_s,
+                close_s,
+                metadata_s,
+                data_settle_s,
+                robot_s,
+                renderer_s,
+                executor_s,
+                object_manager_s,
+                self._n_batch,
+            )
 
     @property
     def mj_datas(self) -> Sequence[MjData]:

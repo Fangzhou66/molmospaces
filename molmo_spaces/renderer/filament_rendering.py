@@ -1,3 +1,7 @@
+import logging
+import hashlib
+import os
+import time
 from typing import Any
 
 import mujoco as mj
@@ -5,6 +9,7 @@ import numpy as np
 
 from molmo_spaces.env.mj_extensions import MjModelBindings
 from molmo_spaces.renderer.abstract_renderer import MjAbstractRenderer
+from molmo_spaces.utils.filament_context_lock import filament_context_creation_lock
 
 import os as _os
 # Datagen render-diet only: the upstream plain-RGB path does a redundant 2nd
@@ -14,6 +19,82 @@ import os as _os
 # Gated on MS_RENDER_KEEP_CAMERAS so DEFAULT / RL behaviour stays byte-identical
 # to upstream (double read); only diet datagen workers drop the duplicate.
 _MS_RENDER_DIET = _os.environ.get("MS_RENDER_KEEP_CAMERAS") is not None
+log = logging.getLogger(__name__)
+
+_PROCESS_TEXTURE_KEYS: set[str] = set()
+
+
+def _model_cstring(chars, start: int) -> str:
+    if start < 0:
+        return ""
+    try:
+        raw = np.asarray(chars).tobytes()[start:]
+    except Exception:
+        raw = bytes(chars)[start:]
+    end = raw.find(b"\x00")
+    if end >= 0:
+        raw = raw[:end]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _texture_key(model: mj.MjModel, tex_id: int) -> tuple[str, int]:
+    height = int(model.tex_height[tex_id])
+    width = int(model.tex_width[tex_id])
+    nchannel = int(model.tex_nchannel[tex_id])
+    nbytes = height * width * nchannel
+
+    path = _model_cstring(model.paths, int(model.tex_pathadr[tex_id]))
+    if path:
+        return f"path:{path}", nbytes
+
+    adr = int(model.tex_adr[tex_id])
+    tex_data = np.asarray(model.tex_data, dtype=np.uint8)[adr : adr + nbytes]
+    digest = hashlib.blake2b(tex_data, digest_size=16).hexdigest()
+    return (
+        "data:"
+        f"type={int(model.tex_type[tex_id])}:"
+        f"colorspace={int(model.tex_colorspace[tex_id])}:"
+        f"shape={height}x{width}x{nchannel}:"
+        f"{digest}",
+        nbytes,
+    )
+
+
+def _log_texture_cache_potential(model: mj.MjModel) -> None:
+    if os.environ.get("ALICE_MS_FIL_TEXTURE_CACHE_LOG", "1").lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+
+    keys = []
+    total_bytes = 0
+    for tex_id in range(int(model.ntex)):
+        key, nbytes = _texture_key(model, tex_id)
+        keys.append(key)
+        total_bytes += nbytes
+
+    unique_keys = set(keys)
+    hits = sum(1 for key in keys if key in _PROCESS_TEXTURE_KEYS)
+    misses = len(unique_keys - _PROCESS_TEXTURE_KEYS)
+    _PROCESS_TEXTURE_KEYS.update(unique_keys)
+    hit_rate = hits / len(keys) if keys else 0.0
+    log.info(
+        "MS_FILAMENT_TEXTURE_CACHE_POTENTIAL pid=%d ntex=%d unique_in_model=%d "
+        "duplicate_in_model=%d process_seen_hits=%d process_new_unique=%d "
+        "process_seen_total_unique=%d hit_rate=%.3f texture_mb=%.1f",
+        os.getpid(),
+        int(model.ntex),
+        len(unique_keys),
+        len(keys) - len(unique_keys),
+        hits,
+        misses,
+        len(_PROCESS_TEXTURE_KEYS),
+        hit_rate,
+        total_bytes / (1024 * 1024),
+    )
 
 
 def prepare_locals_for_super(
@@ -64,7 +145,25 @@ class MjFilamentRenderer(MjAbstractRenderer):
         # Enable shadow rendering by default (shadows are controlled by lights with castshadow enabled)
         self._scene.flags[mj.mjtRndFlag.mjRND_SHADOW] = True
 
-        self._mjr_context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
+        _log_texture_cache_potential(model)
+        with filament_context_creation_lock("MjFilamentRenderer.MjrContext") as lock_info:
+            context_t0 = time.monotonic()
+            self._mjr_context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
+            context_s = time.monotonic() - context_t0
+        log.info(
+            "MS_FILAMENT_MJR_CONTEXT_TIMING gpu=%s slots=%s slot=%s "
+            "wait_s=%.3f context_s=%.3f lock_hold_s=%.3f "
+            "ngeom=%d nmesh=%d ntex=%d",
+            lock_info.get("gpu"),
+            lock_info.get("slots"),
+            lock_info.get("slot"),
+            float(lock_info.get("waited_s") or 0.0),
+            context_s,
+            float(lock_info.get("hold_s") or 0.0),
+            int(model.ngeom),
+            int(model.nmesh),
+            int(model.ntex),
+        )
         # mj.mjr_resizeOffscreen(width, height, self._mjr_context)
         mj.mjr_setBuffer(mj.mjtFramebuffer.mjFB_OFFSCREEN.value, self._mjr_context)
         self._mjr_context.readDepthMap = mj.mjtDepthMap.mjDEPTH_ZEROFAR

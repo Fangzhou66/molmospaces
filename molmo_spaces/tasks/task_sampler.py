@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import random
+import time
 from abc import abstractmethod
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -811,6 +812,7 @@ class BaseMujocoTaskSampler:
         # Track scene compilation time (XML processing + MuJoCo spec.compile())
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_compile")
+        scene_compile_t0 = time.monotonic()
         try:
             enable_door_randomization = getattr(
                 self.config.task_sampler_config, "enable_door_joint_randomization", False
@@ -838,6 +840,13 @@ class BaseMujocoTaskSampler:
             ) from e
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_compile")
+        scene_compile_s = time.monotonic() - scene_compile_t0
+        if getattr(mujoco, "mjRENDERER", "classic") == "filament":
+            log.info(
+                "MS_FILAMENT_SCENE_COMPILE_TIMING path=%s compile_s=%.3f",
+                scene_path,
+                scene_compile_s,
+            )
 
         # Create new environment around new model
         if self._env is not None:
@@ -846,15 +855,22 @@ class BaseMujocoTaskSampler:
         # Track environment creation time
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("scene_env_create")
-        with _env_creation_lock():
-            self._env = CPUMujocoEnv(
-                self.config,
-                robot_factory=self._create_robot,
-                mj_model=model,
-                mj_base_scene_path=scene_path,
-            )
+        env_create_t0 = time.monotonic()
+        self._env = CPUMujocoEnv(
+            self.config,
+            robot_factory=self._create_robot,
+            mj_model=model,
+            mj_base_scene_path=scene_path,
+        )
+        env_create_s = time.monotonic() - env_create_t0
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")
+        if getattr(mujoco, "mjRENDERER", "classic") == "filament":
+            log.info(
+                "MS_FILAMENT_ENV_CREATE_TIMING path=%s total_s=%.3f",
+                scene_path,
+                env_create_s,
+            )
 
         self.used_robot_positions.clear()
 

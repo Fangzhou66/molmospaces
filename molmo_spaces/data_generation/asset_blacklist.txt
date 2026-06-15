@@ -14,3 +14,5 @@ a3d6f7df9ff94ed59f95d5086d5f3fdd  # objaceilingpanel - mass/inertia too small
 87bb73dea4a341e5b5ead7543881f47d  # mass/inertia error from objaceilingtile_87bb73dea4a341e5b5ead7543881f47d_1_0_7
 8bde878be8dd4fb7b6914db9c4dd31bb  # objaceilingpanel_8bde878be8dd4fb7b6914db9c4dd31bb_1_0_2
 bf8ace08150545fb92f037f887658c37  # objaceilingtile_bf8ace08150545fb92f037f887658c37_1_0_5
+8d7c5c40c3ca4849ba0a2a1d383a6099  # mass/inertia error from objaceilingmedallion_8d7c5c40c3ca4849ba0a2a1d383a6099_1_0_6
+df4d2da4e9934b82b30f9bcab685a0fd  # mass/inertia error from objaceilingtile_df4d2da4e9934b82b30f9bcab685a0fd_1_0_7
