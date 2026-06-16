@@ -77,14 +77,17 @@ def _build_exp_config(episode: Any, task_horizon: int, seed: int) -> Any:
     from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
     from molmo_spaces.evaluation.eval_main import EvalRuntimeParams
 
+    _task_horizon = task_horizon
+    _seed = seed
+
     class _ProbeEvalConfig(JsonBenchmarkEvalConfig):
         robot_config: FrankaRobotConfig = FrankaRobotConfig()
         policy_config: DummyPolicyConfig = DummyPolicyConfig()
         policy_dt_ms: float = 66.0
         ctrl_dt_ms: float = 2.0
         sim_dt_ms: float = 2.0
-        task_horizon: int = task_horizon
-        seed: int = seed
+        task_horizon: int = _task_horizon
+        seed: int = _seed
         filter_for_successful_trajectories: bool = False
         terminate_upon_success: bool = False
 
