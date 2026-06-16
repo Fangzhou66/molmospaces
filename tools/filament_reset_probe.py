@@ -178,6 +178,7 @@ def _worker_main(
     jobs: list[ProbeJob],
     result_queue: mp.Queue,
 ) -> None:
+    startup_t0 = time.monotonic()
     gpu = jobs[0].gpu if jobs else "0"
     _configure_process_env(gpu, args)
 
@@ -192,10 +193,15 @@ def _worker_main(
     )
 
     # Import MolmoSpaces only after CUDA_VISIBLE_DEVICES and EGL env are set.
+    import_t0 = time.monotonic()
     from molmo_spaces.evaluation.benchmark_schema import load_all_episodes
+    molmospaces_import_s = time.monotonic() - import_t0
 
     benchmark_dir = Path(args.benchmark_dir)
+    benchmark_load_t0 = time.monotonic()
     episodes = load_all_episodes(benchmark_dir)
+    benchmark_load_s = time.monotonic() - benchmark_load_t0
+    worker_startup_s = time.monotonic() - startup_t0
     for job in jobs:
         episode = episodes[job.episode_index % len(episodes)]
         horizon = args.task_horizon or _episode_horizon(episode, args.default_task_horizon)
@@ -212,6 +218,9 @@ def _worker_main(
                 "gpu": gpu,
                 "k": args.k,
                 "pid": os.getpid(),
+                "worker_startup_s": worker_startup_s,
+                "molmospaces_import_s": molmospaces_import_s,
+                "benchmark_load_s": benchmark_load_s,
             }
         )
         result_queue.put(row)
@@ -235,7 +244,7 @@ def _build_jobs(args: argparse.Namespace) -> list[list[ProbeJob]]:
     return worker_jobs
 
 
-def _write_summary(rows: list[dict[str, Any]], output_csv: Path) -> Path:
+def _write_summary(rows: list[dict[str, Any]], output_csv: Path, wall_s: float) -> Path:
     summary_path = output_csv.with_suffix(".summary.json")
     ok_rows = [row for row in rows if int(row.get("ok") or 0) == 1]
 
@@ -258,10 +267,15 @@ def _write_summary(rows: list[dict[str, Any]], output_csv: Path) -> Path:
         "ok_rows": len(ok_rows),
         "failed_rows": len(rows) - len(ok_rows),
         "output_csv": str(output_csv),
+        "wall_s": wall_s,
+        "episodes_per_min": (len(ok_rows) / wall_s * 60.0) if wall_s > 0 else None,
         "stats": {
             key: stats(key)
             for key in (
                 "total_s",
+                "worker_startup_s",
+                "molmospaces_import_s",
+                "benchmark_load_s",
                 "sampler_init_s",
                 "sample_task_s",
                 "task_reset_s",
@@ -274,6 +288,7 @@ def _write_summary(rows: list[dict[str, Any]], output_csv: Path) -> Path:
 
 
 def main() -> int:
+    wall_t0 = time.monotonic()
     parser = argparse.ArgumentParser(
         description="Probe MolmoSpaces Filament reset/render timings without Alice.",
     )
@@ -324,6 +339,7 @@ def main() -> int:
         print(
             f"{status} worker={row.get('worker_id')} gpu={row.get('gpu')} "
             f"ep={row.get('episode_index')} total_s={float(row.get('total_s') or 0):.3f} "
+            f"startup_s={float(row.get('worker_startup_s') or 0):.3f} "
             f"sample_task_s={float(row.get('sample_task_s') or 0):.3f} "
             f"task_reset_s={float(row.get('task_reset_s') or 0):.3f}",
             flush=True,
@@ -346,6 +362,9 @@ def main() -> int:
         "scene_dataset",
         "data_split",
         "task_type",
+        "worker_startup_s",
+        "molmospaces_import_s",
+        "benchmark_load_s",
         "total_s",
         "sampler_init_s",
         "sample_task_s",
@@ -358,9 +377,14 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
 
-    summary_path = _write_summary(rows, args.output)
+    wall_s = time.monotonic() - wall_t0
+    summary_path = _write_summary(rows, args.output, wall_s)
     print(f"wrote_csv={args.output}")
     print(f"wrote_summary={summary_path}")
+    print(f"wall_s={wall_s:.3f}")
+    ok_rows = [row for row in rows if int(row.get("ok") or 0) == 1]
+    if wall_s > 0:
+        print(f"episodes_per_min={len(ok_rows) / wall_s * 60.0:.3f}")
     if bad_exit:
         print(f"worker_exit_errors={bad_exit}", file=sys.stderr)
         return 2
