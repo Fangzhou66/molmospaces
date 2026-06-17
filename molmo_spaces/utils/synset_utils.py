@@ -2,12 +2,25 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
 
+_NLTK_CORPORA = ("wordnet", "wordnet2022")
+
+
+def _nltk_corpus_available(nltk, corpus: str) -> bool:
+    for resource in (f"corpora/{corpus}", f"corpora/{corpus}.zip"):
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            continue
+        return True
+    return False
+
 
 def _ensure_nltk():
     import nltk
 
-    for corpus in ["wordnet", "wordnet2022"]:
-        nltk.download(corpus)
+    for corpus in _NLTK_CORPORA:
+        if not _nltk_corpus_available(nltk, corpus):
+            nltk.download(corpus, quiet=True, raise_on_error=False)
 
 
 _ensure_nltk()
