@@ -62,7 +62,7 @@ from molmo_spaces.evaluation.benchmark_schema import (
 )
 from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
 from molmo_spaces.tasks.task import BaseMujocoTask
-from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler
+from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler, get_static_asset_blacklist
 from molmo_spaces.utils.constants.simulation_constants import OBJAVERSE_FREE_JOINT_DEFAULT_DAMPING
 from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
@@ -175,6 +175,29 @@ def camera_spec_to_config(
         )
     else:
         raise ValueError(f"Unknown camera spec type: {type(spec)}")
+
+
+def missing_object_pose_body_skip_reason(
+    body_name: str,
+    selected_place_receptacle_name: str | None,
+    static_asset_blacklist: set[str] | None = None,
+) -> str | None:
+    """Return why a missing object_poses body can be skipped, or None to raise."""
+    if (
+        selected_place_receptacle_name
+        and body_name.startswith("place_receptacle/")
+        and body_name != selected_place_receptacle_name
+    ):
+        return "unselected place_receptacle candidate"
+
+    blacklist = static_asset_blacklist
+    if blacklist is None:
+        blacklist = get_static_asset_blacklist()
+    for uid in sorted(blacklist):
+        if uid and uid in body_name:
+            return f"static-blacklisted body ({uid})"
+
+    return None
 
 
 class JsonEvalTaskSampler(BaseMujocoTaskSampler):
@@ -611,10 +634,21 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         object_poses = self.episode_spec.scene_modifications.object_poses
         if object_poses:
             log.info(f"randomize_scene: Setting poses for {len(object_poses)} objects")
+            selected_place_receptacle_name = self.episode_spec.task.get("place_receptacle_name")
             for body_name, pose in object_poses.items():
                 try:
                     body = create_mlspaces_body(data, body_name)
                 except KeyError:
+                    skip_reason = missing_object_pose_body_skip_reason(
+                        body_name,
+                        selected_place_receptacle_name,
+                    )
+                    if skip_reason is not None:
+                        log.info(
+                            f"Skipping pose for absent body '{body_name}': {skip_reason}"
+                        )
+                        continue
+
                     # Get available body names for debugging
                     available_bodies = [data.body(i).name for i in range(model.nbody)]
                     log.error(

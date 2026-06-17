@@ -30,6 +30,7 @@ from molmo_spaces.tasks.json_eval_task_sampler import (
     JsonEvalTaskSampler,
     camera_spec_to_config,
     import_class_from_string,
+    missing_object_pose_body_skip_reason,
 )
 
 TEST_BENCHMARK_PATH = Path(__file__).parent / "test_benchmark"
@@ -177,6 +178,46 @@ class TestCameraSpecToConfig:
 
         assert isinstance(config, FixedExocentricCameraConfig)
         assert config.name == "test_exo"
+
+
+class TestMissingObjectPoseBodySkipReason:
+    """Tests for absent object_poses body filtering."""
+
+    def test_unselected_place_receptacle_candidate_is_skipped(self):
+        reason = missing_object_pose_body_skip_reason(
+            body_name="place_receptacle/0_1/Bowl_deadbeef_1_0_2",
+            selected_place_receptacle_name="place_receptacle/0_0/Bowl_deadbeef_1_0_2",
+            static_asset_blacklist=set(),
+        )
+
+        assert reason == "unselected place_receptacle candidate"
+
+    def test_selected_place_receptacle_candidate_is_not_skipped(self):
+        reason = missing_object_pose_body_skip_reason(
+            body_name="place_receptacle/0_0/Bowl_deadbeef_1_0_2",
+            selected_place_receptacle_name="place_receptacle/0_0/Bowl_deadbeef_1_0_2",
+            static_asset_blacklist=set(),
+        )
+
+        assert reason is None
+
+    def test_static_blacklisted_body_is_skipped(self):
+        reason = missing_object_pose_body_skip_reason(
+            body_name="objaceilingpanel_a3d6f7df9ff94ed59f95d5086d5f3fdd_1_0_4",
+            selected_place_receptacle_name=None,
+            static_asset_blacklist={"a3d6f7df9ff94ed59f95d5086d5f3fdd"},
+        )
+
+        assert reason == "static-blacklisted body (a3d6f7df9ff94ed59f95d5086d5f3fdd)"
+
+    def test_unrelated_missing_body_is_not_skipped(self):
+        reason = missing_object_pose_body_skip_reason(
+            body_name="pickup_obj/not_blacklisted",
+            selected_place_receptacle_name="place_receptacle/0_0/Bowl_deadbeef_1_0_2",
+            static_asset_blacklist={"a3d6f7df9ff94ed59f95d5086d5f3fdd"},
+        )
+
+        assert reason is None
 
 
 class TestBenchmarkLoading:
