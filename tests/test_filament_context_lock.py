@@ -70,6 +70,53 @@ class FilamentContextLockTests(unittest.TestCase):
                 with filament_context_creation_lock("test-create"):
                     pass
 
+    def test_free_uses_create_time_drain_metadata_when_env_drifts_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "ALICE_MOLMOSPACES_FILAMENT_RESET_LOCK": f"{tmp}/fil.lock",
+                "ALICE_MS_FIL_FREE_DRAIN": "1",
+                "ALICE_MS_FIL_LOCK_SCOPE": "context",
+                "ALICE_MS_FIL_LOCK_SHARD": "1",
+                "ALICE_MS_FIL_RESET_CONCURRENCY": "1",
+                "ALICE_MS_FIL_LOCK_TIMEOUT_S": "1",
+                "CUDA_VISIBLE_DEVICES": "3",
+            },
+            clear=True,
+        ):
+            with filament_context_creation_lock("test-create") as info:
+                namespace = info["namespace"]
+
+            os.environ["ALICE_MS_FIL_FREE_DRAIN"] = "0"
+            with filament_context_free_lock(namespace, "test-free") as free_info:
+                self.assertTrue(free_info["enabled"])
+                self.assertEqual(free_info["slot"], "all")
+
+    def test_free_uses_create_time_legacy_metadata_when_env_drifts_on(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "ALICE_MOLMOSPACES_FILAMENT_RESET_LOCK": f"{tmp}/fil.lock",
+                "ALICE_MS_FIL_LOCK_SCOPE": "context",
+                "ALICE_MS_FIL_LOCK_SHARD": "1",
+                "ALICE_MS_FIL_RESET_CONCURRENCY": "1",
+                "CUDA_VISIBLE_DEVICES": "4",
+            },
+            clear=True,
+        ):
+            with filament_context_creation_lock("test-create") as info:
+                namespace = info["namespace"]
+
+            os.environ["ALICE_MS_FIL_FREE_DRAIN"] = "1"
+            with filament_context_free_lock(namespace, "test-free") as free_info:
+                self.assertFalse(free_info["enabled"])
+
+    def test_drain_free_rejects_missing_create_time_metadata(self) -> None:
+        with patch.dict(os.environ, {"ALICE_MS_FIL_FREE_DRAIN": "1"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                with filament_context_free_lock(None, "test-free"):
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()

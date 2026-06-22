@@ -83,6 +83,7 @@ def resolve_filament_lock_namespace() -> dict[str, Any]:
     )
     return {
         "enabled": scope in _FILAMENT_CONTEXT_ACTIVE_SCOPES,
+        "free_drain_enabled": True,
         "scope": scope,
         "base_path": lock_path,
         "path": lock_path,
@@ -157,7 +158,7 @@ def _legacy_filament_context_creation_lock(label: str = "mjr_context"):
             "gpu": "disabled",
             "path": "",
             "label": label,
-            "namespace": None,
+            "namespace": {"free_drain_enabled": False},
         }
         return
 
@@ -204,7 +205,7 @@ def _legacy_filament_context_creation_lock(label: str = "mjr_context"):
         "gpu": gpu,
         "path": lock_path,
         "label": label,
-        "namespace": None,
+        "namespace": {"free_drain_enabled": False},
     }
 
     try:
@@ -384,7 +385,7 @@ def filament_context_creation_lock(label: str = "mjr_context"):
 @contextmanager
 def filament_context_free_lock(namespace: dict[str, Any] | None, label: str = "mjr_context.free"):
     """Serialize MjrContext.free() against all in-flight context creates."""
-    if not filament_free_drain_enabled():
+    if namespace is not None and not namespace.get("free_drain_enabled", False):
         yield {
             "enabled": False,
             "op": "free",
@@ -395,14 +396,28 @@ def filament_context_free_lock(namespace: dict[str, Any] | None, label: str = "m
             "gpu": "disabled",
             "path": "",
             "label": label,
-            "namespace": None,
+            "namespace": namespace,
         }
         return
     if namespace is None or not namespace.get("enabled"):
-        raise RuntimeError(
-            "ALICE_MS_FIL_FREE_DRAIN=1 requires create-time Filament lock metadata "
-            "before MjrContext.free(); refusing to destroy without synchronization."
-        )
+        if filament_free_drain_enabled():
+            raise RuntimeError(
+                "ALICE_MS_FIL_FREE_DRAIN=1 requires create-time Filament lock metadata "
+                "before MjrContext.free(); refusing to destroy without synchronization."
+            )
+        yield {
+            "enabled": False,
+            "op": "free",
+            "waited_s": 0.0,
+            "hold_s": 0.0,
+            "slot": None,
+            "slots": 0,
+            "gpu": "disabled",
+            "path": "",
+            "label": label,
+            "namespace": namespace,
+        }
+        return
 
     timeout_s = float(namespace["timeout_s"])
     deadline = time.monotonic() + timeout_s
