@@ -67,6 +67,7 @@ def _configure_process_env(gpu: str, args: argparse.Namespace) -> None:
     os.environ.setdefault("ALICE_MS_FIL_RESET_CONCURRENCY", str(args.k))
     os.environ.setdefault("ALICE_MS_FIL_LOCK_TIMEOUT_S", str(args.lock_timeout_s))
     os.environ.setdefault("ALICE_MS_FIL_LOCK_SHARD", "1")
+    os.environ.setdefault("ALICE_MS_FIL_FREE_DRAIN", "1")
     os.environ.setdefault("ALICE_MS_FIL_TEXTURE_CACHE_LOG", "1" if args.texture_log else "0")
 
 
