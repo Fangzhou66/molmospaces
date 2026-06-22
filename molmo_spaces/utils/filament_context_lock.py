@@ -13,6 +13,8 @@ _FILAMENT_CONTEXT_LOCK_PATH = "/tmp/alice_molmospaces_filament_reset.lock"
 # lock-free CPU asset prep with the driver write-lock phase without over-contending.
 _FILAMENT_CONTEXT_CONCURRENCY_DEFAULT = 2
 _FILAMENT_CONTEXT_LOCK_TIMEOUT_S = 240.0
+_FILAMENT_CONTEXT_ACTIVE_SCOPES = {"context", "mjr_context", "narrow"}
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -45,8 +47,98 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
+def _flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+
+
+def filament_free_drain_enabled() -> bool:
+    return _flag_enabled("ALICE_MS_FIL_FREE_DRAIN")
+
+
+def resolve_filament_lock_namespace() -> dict[str, Any]:
+    """Resolve the shared Filament lifecycle lock namespace once.
+
+    The returned namespace is used by both create and free when
+    ALICE_MS_FIL_FREE_DRAIN=1, so free waits on the exact slot set used by the
+    corresponding create even if environment variables drift later.
+    """
+    scope = os.environ.get("ALICE_MS_FIL_LOCK_SCOPE", "context").strip().lower()
+    lock_path = os.environ.get(
+        "ALICE_MOLMOSPACES_FILAMENT_RESET_LOCK",
+        _FILAMENT_CONTEXT_LOCK_PATH,
+    )
+    if os.environ.get("ALICE_MS_FIL_LOCK_SHARD", "1") == "1":
+        gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "na").split(",")[0]
+        lock_path = f"{lock_path}.gpu{gpu or 'na'}"
+    else:
+        gpu = "global"
+
+    slots = _positive_int_env(
+        "ALICE_MS_FIL_RESET_CONCURRENCY",
+        _FILAMENT_CONTEXT_CONCURRENCY_DEFAULT,
+    )
+    timeout_s = _positive_float_env(
+        "ALICE_MS_FIL_LOCK_TIMEOUT_S",
+        _FILAMENT_CONTEXT_LOCK_TIMEOUT_S,
+    )
+    return {
+        "enabled": scope in _FILAMENT_CONTEXT_ACTIVE_SCOPES,
+        "scope": scope,
+        "base_path": lock_path,
+        "path": lock_path,
+        "gpu": gpu,
+        "slots": slots,
+        "slot_paths": tuple(f"{lock_path}.slot{i}" for i in range(slots)),
+        "drain_path": f"{lock_path}.drain",
+        "timeout_s": timeout_s,
+    }
+
+
+def _ensure_lock_dir(path: str) -> None:
+    lock_dir = os.path.dirname(path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+
+
+def _open_lock_file(path: str):
+    _ensure_lock_dir(path)
+    return open(path, "a+", encoding="utf-8")
+
+
+def _lock_ex_until(lock_file, deadline: float, description: str) -> float:
+    import fcntl
+
+    start = time.monotonic()
+    next_log = start + 30.0
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return time.monotonic() - start
+        except BlockingIOError:
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for {description} after {now - start:.1f}s"
+                )
+            if now >= next_log:
+                log.info(
+                    "MolmoSpacesEnv: still waiting %.1fs for %s (pid=%d)",
+                    now - start,
+                    description,
+                    os.getpid(),
+                )
+                next_log = now + 30.0
+            time.sleep(0.05)
+
+
+def _unlock_file(lock_file) -> None:
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
-def filament_context_creation_lock(label: str = "mjr_context"):
+def _legacy_filament_context_creation_lock(label: str = "mjr_context"):
     """Limit concurrent Filament MjrContext creation across processes.
 
     This intentionally uses the same env vars and lock-file naming as Alice's
@@ -54,9 +146,10 @@ def filament_context_creation_lock(label: str = "mjr_context"):
     creation point. `flock` auto-releases on process death/SIGKILL.
     """
     scope = os.environ.get("ALICE_MS_FIL_LOCK_SCOPE", "context").lower()
-    if scope not in ("context", "mjr_context", "narrow"):
+    if scope not in _FILAMENT_CONTEXT_ACTIVE_SCOPES:
         yield {
             "enabled": False,
+            "op": "create",
             "waited_s": 0.0,
             "hold_s": 0.0,
             "slot": None,
@@ -64,6 +157,7 @@ def filament_context_creation_lock(label: str = "mjr_context"):
             "gpu": "disabled",
             "path": "",
             "label": label,
+            "namespace": None,
         }
         return
 
@@ -102,6 +196,7 @@ def filament_context_creation_lock(label: str = "mjr_context"):
     order_start = os.getpid() % slots
     info: dict[str, Any] = {
         "enabled": True,
+        "op": "create",
         "waited_s": 0.0,
         "hold_s": 0.0,
         "slot": None,
@@ -109,6 +204,7 @@ def filament_context_creation_lock(label: str = "mjr_context"):
         "gpu": gpu,
         "path": lock_path,
         "label": label,
+        "namespace": None,
     }
 
     try:
@@ -176,3 +272,187 @@ def filament_context_creation_lock(label: str = "mjr_context"):
     finally:
         for lock_file in files:
             lock_file.close()
+
+
+@contextmanager
+def _drained_filament_context_creation_lock(label: str = "mjr_context"):
+    ns = resolve_filament_lock_namespace()
+    if not ns["enabled"]:
+        raise RuntimeError(
+            "ALICE_MS_FIL_FREE_DRAIN=1 requires ALICE_MS_FIL_LOCK_SCOPE to be "
+            f"one of {sorted(_FILAMENT_CONTEXT_ACTIVE_SCOPES)}; got {ns['scope']!r}"
+        )
+
+    import fcntl
+
+    timeout_s = float(ns["timeout_s"])
+    deadline = time.monotonic() + timeout_s
+    drain_file = _open_lock_file(str(ns["drain_path"]))
+    slot_files = [_open_lock_file(path) for path in ns["slot_paths"]]
+    acquired_slot_file = None
+    acquired_slot = None
+    hold_start = None
+    start = time.monotonic()
+    order_start = os.getpid() % int(ns["slots"])
+    info: dict[str, Any] = {
+        "enabled": True,
+        "op": "create",
+        "waited_s": 0.0,
+        "hold_s": 0.0,
+        "slot": None,
+        "slots": ns["slots"],
+        "gpu": ns["gpu"],
+        "path": ns["base_path"],
+        "drain_path": ns["drain_path"],
+        "label": label,
+        "namespace": ns,
+    }
+
+    try:
+        while acquired_slot_file is None:
+            _lock_ex_until(drain_file, deadline, f"filament drain gate {ns['drain_path']}")
+            drain_locked = True
+            try:
+                for offset in range(int(ns["slots"])):
+                    slot = (order_start + offset) % int(ns["slots"])
+                    lock_file = slot_files[slot]
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    acquired_slot_file = lock_file
+                    acquired_slot = slot
+                    break
+            finally:
+                if drain_locked:
+                    _unlock_file(drain_file)
+
+            if acquired_slot_file is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for MolmoSpaces filament context token "
+                    f"after {time.monotonic() - start:.1f}s "
+                    f"(pid={os.getpid()} gpu={ns['gpu']} slots={ns['slots']} "
+                    f"base={ns['base_path']})"
+                )
+            time.sleep(0.05)
+
+        waited = time.monotonic() - start
+        hold_start = time.monotonic()
+        acquired_slot_file.seek(0)
+        acquired_slot_file.truncate()
+        acquired_slot_file.write(
+            f"pid={os.getpid()} gpu={ns['gpu']} label={label} acquired_at={time.time():.3f}\n"
+        )
+        acquired_slot_file.flush()
+        info.update({"waited_s": waited, "slot": acquired_slot})
+        if waited > 1.0:
+            log.info(
+                "MolmoSpacesEnv: waited %.1fs for filament context token "
+                "(pid=%d gpu=%s slot=%s/%d label=%s drain=%s)",
+                waited,
+                os.getpid(),
+                ns["gpu"],
+                acquired_slot,
+                ns["slots"],
+                label,
+                ns["drain_path"],
+            )
+        try:
+            yield info
+        finally:
+            info["hold_s"] = time.monotonic() - hold_start if hold_start is not None else 0.0
+            if acquired_slot_file is not None:
+                _unlock_file(acquired_slot_file)
+    finally:
+        for lock_file in slot_files:
+            lock_file.close()
+        drain_file.close()
+
+
+@contextmanager
+def filament_context_creation_lock(label: str = "mjr_context"):
+    if not filament_free_drain_enabled():
+        with _legacy_filament_context_creation_lock(label) as info:
+            yield info
+        return
+    with _drained_filament_context_creation_lock(label) as info:
+        yield info
+
+
+@contextmanager
+def filament_context_free_lock(namespace: dict[str, Any] | None, label: str = "mjr_context.free"):
+    """Serialize MjrContext.free() against all in-flight context creates."""
+    if not filament_free_drain_enabled():
+        yield {
+            "enabled": False,
+            "op": "free",
+            "waited_s": 0.0,
+            "hold_s": 0.0,
+            "slot": None,
+            "slots": 0,
+            "gpu": "disabled",
+            "path": "",
+            "label": label,
+            "namespace": None,
+        }
+        return
+    if namespace is None or not namespace.get("enabled"):
+        raise RuntimeError(
+            "ALICE_MS_FIL_FREE_DRAIN=1 requires create-time Filament lock metadata "
+            "before MjrContext.free(); refusing to destroy without synchronization."
+        )
+
+    timeout_s = float(namespace["timeout_s"])
+    deadline = time.monotonic() + timeout_s
+    drain_file = _open_lock_file(str(namespace["drain_path"]))
+    slot_files = [_open_lock_file(path) for path in namespace["slot_paths"]]
+    acquired_slot_files = []
+    drain_locked = False
+    hold_start = None
+    start = time.monotonic()
+    info: dict[str, Any] = {
+        "enabled": True,
+        "op": "free",
+        "waited_s": 0.0,
+        "hold_s": 0.0,
+        "slot": "all",
+        "slots": namespace["slots"],
+        "gpu": namespace["gpu"],
+        "path": namespace["base_path"],
+        "drain_path": namespace["drain_path"],
+        "label": label,
+        "namespace": namespace,
+    }
+
+    try:
+        _lock_ex_until(drain_file, deadline, f"filament drain gate {namespace['drain_path']}")
+        drain_locked = True
+        for lock_file in slot_files:
+            _lock_ex_until(lock_file, deadline, f"filament free slot {lock_file.name}")
+            acquired_slot_files.append(lock_file)
+        waited = time.monotonic() - start
+        hold_start = time.monotonic()
+        info["waited_s"] = waited
+        if waited > 1.0:
+            log.info(
+                "MolmoSpacesEnv: waited %.1fs for filament context free "
+                "(pid=%d gpu=%s slots=%d label=%s drain=%s)",
+                waited,
+                os.getpid(),
+                namespace["gpu"],
+                namespace["slots"],
+                label,
+                namespace["drain_path"],
+            )
+        yield info
+    finally:
+        info["hold_s"] = time.monotonic() - hold_start if hold_start is not None else 0.0
+        for lock_file in reversed(acquired_slot_files):
+            _unlock_file(lock_file)
+        if drain_locked:
+            _unlock_file(drain_file)
+        for lock_file in slot_files:
+            lock_file.close()
+        drain_file.close()
