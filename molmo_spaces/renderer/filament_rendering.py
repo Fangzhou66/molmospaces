@@ -9,7 +9,10 @@ import numpy as np
 
 from molmo_spaces.env.mj_extensions import MjModelBindings
 from molmo_spaces.renderer.abstract_renderer import MjAbstractRenderer
-from molmo_spaces.utils.filament_context_lock import filament_context_creation_lock
+from molmo_spaces.utils.filament_context_lock import (
+    filament_context_creation_lock,
+    filament_context_free_lock,
+)
 
 import os as _os
 # Datagen render-diet only: the upstream plain-RGB path does a redundant 2nd
@@ -150,6 +153,7 @@ class MjFilamentRenderer(MjAbstractRenderer):
             context_t0 = time.monotonic()
             self._mjr_context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
             context_s = time.monotonic() - context_t0
+        self._filament_lock_namespace = lock_info.get("namespace")
         log.info(
             "MS_FILAMENT_MJR_CONTEXT_TIMING gpu=%s slots=%s slot=%s "
             "wait_s=%.3f context_s=%.3f lock_hold_s=%.3f "
@@ -450,7 +454,22 @@ class MjFilamentRenderer(MjAbstractRenderer):
 
     def close(self) -> None:
         if hasattr(self, "_mjr_context") and self._mjr_context:
-            self._mjr_context.free()
+            with filament_context_free_lock(
+                getattr(self, "_filament_lock_namespace", None),
+                "MjFilamentRenderer.MjrContext.free",
+            ) as lock_info:
+                free_t0 = time.monotonic()
+                self._mjr_context.free()
+                free_s = time.monotonic() - free_t0
+            log.info(
+                "MS_FILAMENT_MJR_CONTEXT_FREE_TIMING gpu=%s slots=%s "
+                "wait_s=%.3f free_s=%.3f lock_hold_s=%.3f",
+                lock_info.get("gpu"),
+                lock_info.get("slots"),
+                float(lock_info.get("waited_s") or 0.0),
+                free_s,
+                float(lock_info.get("hold_s") or 0.0),
+            )
         self._mjr_context = None
 
 
