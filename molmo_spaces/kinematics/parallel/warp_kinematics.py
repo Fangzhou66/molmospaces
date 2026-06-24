@@ -260,6 +260,11 @@ class SimpleWarpKinematics(ParallelKinematics):
         """
         super().__init__(robot_config)
         self._device = device
+        # Per-INSTANCE SolverData cache. (Was @functools.cache on the method, which keyed on
+        # (self, batch_size) and strong-ref'd every SimpleWarpKinematics ever built -> a fresh
+        # solver per house was pinned forever (compiled MjModel + warp model + MjData + IK scratch)
+        # -> ~157 MB/house host-RAM leak -> OOM. A per-instance dict frees with the instance.)
+        self._solver_data_cache: dict[int, SolverData] = {}
 
         spec = MjSpec()
         robot_config.robot_cls.add_robot_to_scene(
@@ -296,11 +301,13 @@ class SimpleWarpKinematics(ParallelKinematics):
                 "Number of position variables (nq) must equal number of velocity variables (nv) for warp-based IK solver"
             )
 
-    @cache
     def _get_data(self, batch_size: int) -> SolverData:
+        cached = self._solver_data_cache.get(batch_size)
+        if cached is not None:
+            return cached
         with wp.ScopedDevice(self._device):
             data = mjw.make_data(self._mj_model, nworld=batch_size)
-            return SolverData(
+            solver_data = SolverData(
                 data=data,
                 ik_buffers=IKBuffers(
                     pos_err=wp.zeros(batch_size, dtype=wp.vec3f),
@@ -321,6 +328,8 @@ class SimpleWarpKinematics(ParallelKinematics):
                     jacobian_mask=wp.ones((batch_size, self._mj_model.nv), dtype=int),
                 ),
             )
+        self._solver_data_cache[batch_size] = solver_data
+        return solver_data
 
     def _dicts_to_qpos_arr(self, qpos_dicts: list[dict[str, np.ndarray]]) -> np.ndarray:
         ret = np.empty((len(qpos_dicts), self._mj_model.nq), dtype=np.float32)
