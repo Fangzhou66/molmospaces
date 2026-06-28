@@ -94,17 +94,19 @@ class OpeningTask(PickTask):
                 reward_cand = []
                 for articulation_object in self.articulation_objects[n]:
                     for j in range(articulation_object.njoints):
+                        joint_type = articulation_object.get_joint_type(j)
+                        _joint_range = articulation_object.get_joint_range(j)
+                        joint_range_float = np.abs(_joint_range[1] - _joint_range[0])
+                        # P4: skip free + DEGENERATE zero-range joints BEFORE dividing.
+                        # The old guard only caught x/0 -> inf; 0/0 -> nan slipped through,
+                        # poisoning reward_cand -> max() nan -> nan episode reward+success ->
+                        # nonzero_std drops the group -> col3 silently frozen at 0.
+                        if joint_type == mujoco.mjtJoint.mjJNT_FREE or joint_range_float == 0:
+                            continue
                         current_joint_state = articulation_object.get_joint_position(j)
                         # Closed position is always 0, so distance from 0 is the opening amount
                         # abs() handles both positive [0, 1.57] and negative [-1.57, 0] ranges
-                        _joint_range = articulation_object.get_joint_range(j)
-                        joint_range_float = np.abs(_joint_range[1] - _joint_range[0])
                         percent_open = np.abs(current_joint_state) / joint_range_float
-                        joint_type = articulation_object.get_joint_type(j)
-                        if joint_type == mujoco.mjtJoint.mjJNT_FREE or (
-                            percent_open == np.inf and joint_range_float == 0
-                        ):
-                            continue
                         reward_cand.append(percent_open)
                 if len(reward_cand) > 0:
                     rewards_envs[n] = max(reward_cand)
@@ -125,7 +127,12 @@ class OpeningTask(PickTask):
                     self.config.task_config.joint_index
                 )
                 joint_range_float = np.abs(_joint_range[1] - _joint_range[0])
-                percent_open = np.abs(current_joint_state) / joint_range_float
+                # P4: degenerate zero-range joint -> treat as fully closed (0.0) instead of x/0 -> nan/inf.
+                percent_open = (
+                    np.abs(current_joint_state) / joint_range_float
+                    if joint_range_float != 0
+                    else 0.0
+                )
                 rewards_envs[n] = percent_open
 
             # negate the quanity
