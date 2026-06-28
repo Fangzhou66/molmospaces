@@ -473,6 +473,18 @@ class BaseMujocoTask(ABC):
             if isinstance(obj, MlSpacesObjectAbstract):
                 setattr(self, attr, None)
 
+        # Step-2 (RAM): deterministically drop the per-episode history buffers
+        # (observation_cache holds ~150-300MB rendered frames) and the instance
+        # get_task_description closure on EVERY teardown path (rebuild/offload,
+        # not only the reuse loop), so a retained task cannot pin them past close.
+        self.action_cache = []
+        self.observation_cache = []
+        self.reward_cache = []
+        self.terminal_cache = []
+        self.truncated_cache = []
+        self.success_cache = []
+        self.__dict__.pop("get_task_description", None)
+
         # Clear sensor suite
         if hasattr(self, "_sensor_suite"):
             self._sensor_suite = None
