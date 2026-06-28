@@ -924,9 +924,15 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         task_description = self.episode_spec.language.task_description
 
-        def get_task_description(self, _td=task_description) -> str:
+        # Step-2 (RAM): bind a zero-arg closure, NOT types.MethodType. A bound
+        # method whose __self__ is `task` makes an immortal task<->method cycle
+        # (task.__dict__ -> method -> __self__ -> task) refcounting cannot break,
+        # pinning the task + its per-episode caches until gen-2 GC. A plain
+        # function set as an instance attribute is not descriptor-bound, so
+        # task.get_task_description() returns the same string with no ref to task.
+        def _get_task_description(_td=task_description) -> str:
             return _td
 
-        task.get_task_description = types.MethodType(get_task_description, task)
+        task.get_task_description = _get_task_description
 
         return task
