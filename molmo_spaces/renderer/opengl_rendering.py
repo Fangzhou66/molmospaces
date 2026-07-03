@@ -171,6 +171,32 @@ class MjOpenGLRenderer(MjAbstractRenderer):
     def geomid_to_bodyid(self, geomid):
         return self.model.geom_bodyid[geomid]
 
+    def set_scene_camera_pose(
+        self,
+        pos: np.ndarray,
+        forward: np.ndarray,
+        up: np.ndarray,
+    ) -> None:
+        for camera in self._scene.camera:
+            camera.pos = pos
+            camera.forward = forward
+            camera.up = up
+
+    def set_scene_camera_orthographic_frustum(
+        self,
+        *,
+        frustum_bottom: float,
+        frustum_top: float,
+    ) -> None:
+        for camera in self._scene.camera:
+            camera.orthographic = 1
+            camera.frustum_bottom = frustum_bottom
+            camera.frustum_top = frustum_top
+
+    def first_scene_camera_transform(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        camera = self._scene.camera[0]
+        return camera.pos.copy(), camera.forward.copy(), camera.up.copy()
+
     def render(
         self,
         *,
