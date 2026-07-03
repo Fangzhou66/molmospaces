@@ -1,6 +1,7 @@
 import logging
 import hashlib
 import os
+import threading
 import time
 from typing import Any
 
@@ -150,6 +151,7 @@ class MjFilamentRenderer(MjAbstractRenderer):
         self._scene.flags[mj.mjtRndFlag.mjRND_SHADOW] = True
 
         _log_texture_cache_potential(model)
+        self._filament_context_thread_id = threading.get_ident()
         with filament_context_creation_lock("MjFilamentRenderer.MjrContext") as lock_info:
             context_t0 = time.monotonic()
             self._mjr_context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
@@ -458,15 +460,21 @@ class MjFilamentRenderer(MjAbstractRenderer):
             mjr_context = self._mjr_context
             self._mjr_context = None
             namespace = getattr(self, "_filament_lock_namespace", None)
+            owner_thread_id = getattr(self, "_filament_context_thread_id", None)
             label = "MjFilamentRenderer.MjrContext.free"
-            if not schedule_filament_context_free(mjr_context, namespace, label):
+            if not schedule_filament_context_free(
+                mjr_context,
+                namespace,
+                label,
+                owner_thread_id=owner_thread_id,
+            ):
                 with filament_context_free_lock(namespace, label) as lock_info:
                     free_t0 = time.monotonic()
                     mjr_context.free()
                     free_s = time.monotonic() - free_t0
                 log.info(
                     "MS_FILAMENT_MJR_CONTEXT_FREE_TIMING gpu=%s slots=%s "
-                    "wait_s=%.3f free_s=%.3f lock_hold_s=%.3f async=0",
+                    "wait_s=%.3f free_s=%.3f lock_hold_s=%.3f deferred=0",
                     lock_info.get("gpu"),
                     lock_info.get("slots"),
                     float(lock_info.get("waited_s") or 0.0),

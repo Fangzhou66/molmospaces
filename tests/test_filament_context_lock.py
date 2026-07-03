@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -123,7 +124,24 @@ class FilamentContextLockTests(unittest.TestCase):
                 with filament_context_free_lock(None, "test-free"):
                     pass
 
-    def test_async_free_requires_drain_namespace(self) -> None:
+    def test_deferred_free_requires_drain_namespace(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        with patch.dict(os.environ, {"ALICE_MS_FIL_DEFER_FREE": "1"}, clear=True):
+            self.assertFalse(
+                schedule_filament_context_free(
+                    ctx, {"free_drain_enabled": False}, "test-free",
+                )
+            )
+            self.assertFalse(ctx.freed)
+
+    def test_legacy_async_flag_does_not_schedule_free(self) -> None:
         class FakeContext:
             def __init__(self) -> None:
                 self.freed = False
@@ -135,12 +153,13 @@ class FilamentContextLockTests(unittest.TestCase):
         with patch.dict(os.environ, {"ALICE_MS_FIL_ASYNC_FREE": "1"}, clear=True):
             self.assertFalse(
                 schedule_filament_context_free(
-                    ctx, {"free_drain_enabled": False}, "test-free",
+                    ctx, {"free_drain_enabled": True, "enabled": False}, "test-free",
                 )
             )
             self.assertFalse(ctx.freed)
+            self.assertEqual(pending_filament_context_frees(), 0)
 
-    def test_async_free_flushes_fake_context(self) -> None:
+    def test_deferred_free_flushes_fake_context(self) -> None:
         class FakeContext:
             def __init__(self) -> None:
                 self.freed = False
@@ -152,8 +171,8 @@ class FilamentContextLockTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "ALICE_MS_FIL_ASYNC_FREE": "1",
-                "ALICE_MS_FIL_ASYNC_FREE_MAX_PENDING": "1",
+                "ALICE_MS_FIL_DEFER_FREE": "1",
+                "ALICE_MS_FIL_DEFER_FREE_MAX_PENDING": "1",
             },
             clear=True,
         ):
@@ -167,7 +186,7 @@ class FilamentContextLockTests(unittest.TestCase):
             self.assertTrue(ctx.freed)
             self.assertEqual(pending_filament_context_frees(), 0)
 
-    def test_creation_lock_flushes_pending_async_free(self) -> None:
+    def test_creation_lock_flushes_pending_deferred_free(self) -> None:
         class FakeContext:
             def __init__(self) -> None:
                 self.freed = False
@@ -180,8 +199,8 @@ class FilamentContextLockTests(unittest.TestCase):
             os.environ,
             {
                 "ALICE_MOLMOSPACES_FILAMENT_RESET_LOCK": f"{tmp}/fil.lock",
-                "ALICE_MS_FIL_ASYNC_FREE": "1",
-                "ALICE_MS_FIL_ASYNC_FREE_MAX_PENDING": "1",
+                "ALICE_MS_FIL_DEFER_FREE": "1",
+                "ALICE_MS_FIL_DEFER_FREE_MAX_PENDING": "1",
                 "ALICE_MS_FIL_FREE_DRAIN": "1",
                 "ALICE_MS_FIL_LOCK_SCOPE": "context",
                 "ALICE_MS_FIL_LOCK_SHARD": "1",
@@ -195,6 +214,117 @@ class FilamentContextLockTests(unittest.TestCase):
             self.assertTrue(schedule_filament_context_free(ctx, namespace, "test-free"))
             with filament_context_creation_lock("test-create"):
                 self.assertTrue(ctx.freed)
+            self.assertEqual(pending_filament_context_frees(), 0)
+
+    def test_deferred_free_flushes_from_owner_thread(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        owner_thread_id_holder: list[int] = []
+        scheduled = threading.Event()
+        flush_from_owner = threading.Event()
+        worker_error: list[BaseException] = []
+
+        def enqueue_from_worker() -> None:
+            try:
+                owner_thread_id_holder.append(threading.get_ident())
+                self.assertTrue(
+                    schedule_filament_context_free(
+                        ctx,
+                        {"free_drain_enabled": True, "enabled": False},
+                        "test-free",
+                        owner_thread_id=owner_thread_id_holder[0],
+                    )
+                )
+                scheduled.set()
+                flush_from_owner.wait(timeout=5)
+                self.assertEqual(flush_filament_context_frees(), 1)
+            except BaseException as exc:  # noqa: BLE001 - re-raise on main thread.
+                worker_error.append(exc)
+                scheduled.set()
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALICE_MS_FIL_DEFER_FREE": "1",
+                "ALICE_MS_FIL_DEFER_FREE_MAX_PENDING": "1",
+            },
+            clear=True,
+        ):
+            worker = threading.Thread(target=enqueue_from_worker)
+            worker.start()
+            self.assertTrue(scheduled.wait(timeout=5))
+            if worker_error:
+                raise worker_error[0]
+            flush_from_owner.set()
+            worker.join()
+            if worker_error:
+                raise worker_error[0]
+
+        self.assertTrue(ctx.freed)
+        self.assertEqual(pending_filament_context_frees(), 0)
+
+    def test_deferred_free_flush_skips_other_owner_thread(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        main_thread_id = threading.get_ident()
+        owner_thread_id_holder: list[int] = []
+        scheduled = threading.Event()
+        flush_from_owner = threading.Event()
+        worker_error: list[BaseException] = []
+
+        def enqueue_from_worker() -> None:
+            try:
+                owner_thread_id_holder.append(threading.get_ident())
+                self.assertTrue(
+                    schedule_filament_context_free(
+                        ctx,
+                        {"free_drain_enabled": True, "enabled": False},
+                        "test-free",
+                        owner_thread_id=owner_thread_id_holder[0],
+                    )
+                )
+                scheduled.set()
+                flush_from_owner.wait(timeout=5)
+                self.assertEqual(flush_filament_context_frees(), 1)
+            except BaseException as exc:  # noqa: BLE001 - re-raise on main thread.
+                worker_error.append(exc)
+                scheduled.set()
+
+        with patch.dict(
+            os.environ,
+            {
+                "ALICE_MS_FIL_DEFER_FREE": "1",
+                "ALICE_MS_FIL_DEFER_FREE_MAX_PENDING": "1",
+            },
+            clear=True,
+        ):
+            worker = threading.Thread(target=enqueue_from_worker)
+            worker.start()
+            self.assertTrue(scheduled.wait(timeout=5))
+            if worker_error:
+                raise worker_error[0]
+            self.assertNotEqual(owner_thread_id_holder[0], main_thread_id)
+            self.assertEqual(pending_filament_context_frees(), 1)
+            self.assertEqual(flush_filament_context_frees(), 0)
+            self.assertFalse(ctx.freed)
+            self.assertEqual(pending_filament_context_frees(), 1)
+            flush_from_owner.set()
+            worker.join()
+            if worker_error:
+                raise worker_error[0]
+            self.assertTrue(ctx.freed)
             self.assertEqual(pending_filament_context_frees(), 0)
 
 
