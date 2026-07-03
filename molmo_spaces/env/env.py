@@ -303,11 +303,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
         self._renderer.update(self.current_data, cam)
 
-        for camera in self._renderer.scene.camera:  # the for loop is necessary!
-            camera: mujoco.MjvGLCamera
-            camera.pos = pos
-            camera.forward = forward
-            camera.up = up
+        self._renderer.set_scene_camera_pose(pos, forward, up)
 
         if segmentation:
             self._renderer.enable_segmentation_rendering()

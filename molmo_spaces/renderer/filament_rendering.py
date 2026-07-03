@@ -1,8 +1,10 @@
 import logging
 import hashlib
 import os
+import queue
 import threading
 import time
+import traceback
 from typing import Any
 
 import mujoco as mj
@@ -27,6 +29,196 @@ _MS_RENDER_DIET = _os.environ.get("MS_RENDER_KEEP_CAMERAS") is not None
 log = logging.getLogger(__name__)
 
 _PROCESS_TEXTURE_KEYS: set[str] = set()
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_ACTOR_CLOSE_LOCK = threading.Lock()
+_ACTOR_PENDING_CLOSES: list[tuple["_FilamentRendererActor", "queue.Queue[tuple[bool, Any]]"]] = []
+
+
+def _flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < 1:
+        log.warning("%s=%r is <1; using %d", name, raw, default)
+        return default
+    return value
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a float; using %.1f", name, raw, default)
+        return default
+    if value <= 0:
+        log.warning("%s=%r is <=0; using %.1f", name, raw, default)
+        return default
+    return value
+
+
+def _actor_enabled() -> bool:
+    return _flag_enabled("ALICE_MS_FIL_RENDERER_ACTOR")
+
+
+def _actor_async_close_enabled() -> bool:
+    return _flag_enabled("ALICE_MS_FIL_RENDERER_ACTOR_ASYNC_CLOSE")
+
+
+def _actor_call_timeout_s() -> float:
+    return _positive_float_env("ALICE_MS_FIL_RENDERER_ACTOR_CALL_TIMEOUT_S", 300.0)
+
+
+def _actor_max_pending_close() -> int:
+    return _positive_int_env("ALICE_MS_FIL_RENDERER_ACTOR_MAX_PENDING_CLOSE", 2)
+
+
+def _await_actor_close(
+    actor: "_FilamentRendererActor",
+    result_queue: "queue.Queue[tuple[bool, Any]]",
+) -> None:
+    ok, result = result_queue.get(timeout=_actor_call_timeout_s())
+    actor.join(timeout=_actor_call_timeout_s())
+    if not ok:
+        raise result
+
+
+def _drain_filament_renderer_actor_closes(*, force: bool) -> int:
+    flushed = 0
+    with _ACTOR_CLOSE_LOCK:
+        kept: list[tuple[_FilamentRendererActor, queue.Queue[tuple[bool, Any]]]] = []
+        for actor, result_queue in _ACTOR_PENDING_CLOSES:
+            if force:
+                _await_actor_close(actor, result_queue)
+                flushed += 1
+                continue
+            try:
+                ok, result = result_queue.get_nowait()
+            except queue.Empty:
+                kept.append((actor, result_queue))
+                continue
+            actor.join(timeout=0.0)
+            flushed += 1
+            if not ok:
+                raise result
+        _ACTOR_PENDING_CLOSES[:] = kept
+
+        while len(_ACTOR_PENDING_CLOSES) >= _actor_max_pending_close():
+            actor, result_queue = _ACTOR_PENDING_CLOSES.pop(0)
+            _await_actor_close(actor, result_queue)
+            flushed += 1
+    return flushed
+
+
+def flush_filament_renderer_actors() -> int:
+    """Wait for all async actor-owned renderer closes in this process."""
+    return _drain_filament_renderer_actor_closes(force=True)
+
+
+class _FilamentRendererActor:
+    def __init__(self, renderer_kwargs: dict[str, Any]) -> None:
+        _drain_filament_renderer_actor_closes(force=False)
+        self._requests: queue.Queue[tuple[str, tuple[Any, ...], dict[str, Any], queue.Queue]] = (
+            queue.Queue()
+        )
+        self._ready: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(renderer_kwargs,),
+            name=f"filament-renderer-actor-{os.getpid()}",
+        )
+        self._thread.start()
+        ok, result = self._ready.get(timeout=_actor_call_timeout_s())
+        if not ok:
+            self._thread.join(timeout=0.1)
+            raise result
+
+    def _run(self, renderer_kwargs: dict[str, Any]) -> None:
+        renderer = None
+        ready_sent = False
+        result_queue: queue.Queue | None = None
+        try:
+            renderer = MjFilamentRenderer(_actor_inner=True, **renderer_kwargs)
+            self._ready.put((True, None))
+            ready_sent = True
+            while True:
+                op, args, kwargs, result_queue = self._requests.get()
+                try:
+                    if op == "__close__":
+                        t0 = time.monotonic()
+                        renderer.close()
+                        renderer = None
+                        log.info(
+                            "MS_FILAMENT_RENDERER_ACTOR_CLOSE_DONE close_s=%.3f",
+                            time.monotonic() - t0,
+                        )
+                        result_queue.put((True, None))
+                        return
+                    result = getattr(renderer, op)(*args, **kwargs)
+                    result_queue.put((True, result))
+                except BaseException as exc:  # noqa: BLE001
+                    log.error(
+                        "MS_FILAMENT_RENDERER_ACTOR_CALL_FAILED op=%s\n%s",
+                        op,
+                        traceback.format_exc(),
+                    )
+                    result_queue.put((False, exc))
+        except BaseException as exc:  # noqa: BLE001
+            log.error("MS_FILAMENT_RENDERER_ACTOR_FAILED\n%s", traceback.format_exc())
+            if not ready_sent:
+                self._ready.put((False, exc))
+            elif result_queue is not None:
+                result_queue.put((False, exc))
+        finally:
+            if renderer is not None:
+                try:
+                    renderer.close()
+                except BaseException:  # noqa: BLE001
+                    log.error(
+                        "MS_FILAMENT_RENDERER_ACTOR_FINAL_CLOSE_FAILED\n%s",
+                        traceback.format_exc(),
+                    )
+
+    def call(self, op: str, *args: Any, **kwargs: Any) -> Any:
+        if self._closed:
+            raise RuntimeError(f"Filament renderer actor is closed; cannot call {op}")
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        self._requests.put((op, args, kwargs, result_queue))
+        ok, result = result_queue.get(timeout=_actor_call_timeout_s())
+        if not ok:
+            raise result
+        return result
+
+    def close(self, *, wait: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        self._requests.put(("__close__", (), {}, result_queue))
+        if wait:
+            _await_actor_close(self, result_queue)
+            return
+        with _ACTOR_CLOSE_LOCK:
+            _ACTOR_PENDING_CLOSES.append((self, result_queue))
+        log.info(
+            "MS_FILAMENT_RENDERER_ACTOR_CLOSE_SCHEDULED pending=%d",
+            len(_ACTOR_PENDING_CLOSES),
+        )
+
+    def join(self, *, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
 
 
 def _model_cstring(chars, start: int) -> str:
@@ -126,8 +318,24 @@ class MjFilamentRenderer(MjAbstractRenderer):
         width: int = 1280,
         max_geom: int = 10000,
         model: mj.MjModel | None = None,
+        _actor_inner: bool = False,
         **kwargs: Any,
     ) -> None:
+        if _actor_enabled() and not _actor_inner:
+            super().__init__(**prepare_locals_for_super(locals()))
+            renderer_kwargs = prepare_locals_for_super(
+                locals(),
+                ignore_kwargs=True,
+            )
+            renderer_kwargs.pop("_actor_inner", None)
+            self._actor = _FilamentRendererActor(renderer_kwargs)
+            self._actor_proxy = True
+            self._closed = False
+            return
+
+        self._actor_proxy = False
+        self._actor = None
+        del _actor_inner
         assert model_bindings is not None or model is not None, (
             "model_bindings or model must be provided"
         )
@@ -186,32 +394,84 @@ class MjFilamentRenderer(MjAbstractRenderer):
 
     @property
     def scene(self) -> mj.MjvScene:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("scene")
         return self._scene
 
     @property
     def height(self):
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("height")
         return self._height
 
     @property
     def width(self):
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("width")
         return self._width
 
     def enable_depth_rendering(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("enable_depth_rendering")
         self._segmentation_rendering = False
         self._depth_rendering = True
 
     def disable_depth_rendering(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("disable_depth_rendering")
         self._depth_rendering = False
 
     def enable_segmentation_rendering(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("enable_segmentation_rendering")
         self._segmentation_rendering = True
         self._depth_rendering = False
 
     def disable_segmentation_rendering(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("disable_segmentation_rendering")
         self._segmentation_rendering = False
 
     def geomid_to_bodyid(self, geomid):
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("geomid_to_bodyid", geomid)
         return self.model.geom_bodyid[geomid]
+
+    def set_scene_camera_pose(
+        self,
+        pos: np.ndarray,
+        forward: np.ndarray,
+        up: np.ndarray,
+    ) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("set_scene_camera_pose", pos, forward, up)
+        for camera in self._scene.camera:
+            camera.pos = pos
+            camera.forward = forward
+            camera.up = up
+
+    def set_scene_camera_orthographic_frustum(
+        self,
+        *,
+        frustum_bottom: float,
+        frustum_top: float,
+    ) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call(
+                "set_scene_camera_orthographic_frustum",
+                frustum_bottom=frustum_bottom,
+                frustum_top=frustum_top,
+            )
+        for camera in self._scene.camera:
+            camera.orthographic = 1
+            camera.frustum_bottom = frustum_bottom
+            camera.frustum_top = frustum_top
+
+    def first_scene_camera_transform(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("first_scene_camera_transform")
+        camera = self._scene.camera[0]
+        return camera.pos.copy(), camera.forward.copy(), camera.up.copy()
 
     def render(
         self,
@@ -220,6 +480,9 @@ class MjFilamentRenderer(MjAbstractRenderer):
         width: int | None = None,
         height: int | None = None,
     ) -> np.ndarray:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("render", out=out, width=width, height=height)
+
         height = height or self._height
         width = width or self._width
         rect = mj.MjrRect(0, 0, width, height)
@@ -350,6 +613,9 @@ class MjFilamentRenderer(MjAbstractRenderer):
         width: int | None = None,
         height: int | None = None,
     ) -> np.ndarray:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("render_rgb", out=out, width=width, height=height)
+
         height = height or self._height
         width = width or self._width
         rect = mj.MjrRect(0, 0, width, height)
@@ -405,6 +671,8 @@ class MjFilamentRenderer(MjAbstractRenderer):
         return out
 
     def upload_textures(self, data: mj.MjData | None = None) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("upload_textures", data=data)
         if self.model.ntex == 0:
             log.debug("upload_textures(): Skipping - no textures in model (ntex == 0)")
             return
@@ -413,6 +681,8 @@ class MjFilamentRenderer(MjAbstractRenderer):
             mj.mjr_uploadTexture(self.model, self._mjr_context, tex_id)
 
     def mark_textures_dirty(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("mark_textures_dirty")
         self._textures_need_upload = True
 
     def update(
@@ -421,6 +691,9 @@ class MjFilamentRenderer(MjAbstractRenderer):
         camera: int | str | mj.MjvCamera = -1,
         scene_option: mj.MjvOption | None = None,
     ) -> None:
+        if getattr(self, "_actor_proxy", False):
+            return self._actor.call("update", data, camera=camera, scene_option=scene_option)
+
         if not isinstance(camera, mj.MjvCamera):
             camera_id = camera
             if isinstance(camera_id, str):
@@ -456,6 +729,13 @@ class MjFilamentRenderer(MjAbstractRenderer):
         )
 
     def close(self) -> None:
+        if getattr(self, "_actor_proxy", False):
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+            self._actor.close(wait=not _actor_async_close_enabled())
+            return
+
         if hasattr(self, "_mjr_context") and self._mjr_context:
             mjr_context = self._mjr_context
             self._mjr_context = None

@@ -620,11 +620,10 @@ class ProcTHORMap(THORMap):
                 model, width=w, height=h, device_id=device_id, use_filament=use_filament
             )
             renderer.update(data, cam)
-            for camera in renderer.scene.camera:
-                camera: mujoco.MjvGLCamera
-                camera.orthographic = 1
-                camera.frustum_bottom = -aabb_size[0] / 2
-                camera.frustum_top = aabb_size[0] / 2
+            renderer.set_scene_camera_orthographic_frustum(
+                frustum_bottom=-aabb_size[0] / 2,
+                frustum_top=aabb_size[0] / 2,
+            )
 
             renderer.enable_segmentation_rendering()
             seg = renderer.render()
@@ -633,13 +632,12 @@ class ProcTHORMap(THORMap):
             cam_to_world = None
             if cam_distance == 5.0:
                 # Extract camera-to-world transformation from the first camera in the scene.
+                camera_pos, camera_forward, camera_up = renderer.first_scene_camera_transform()
                 cam_to_world = np.eye(4)
-                cam_to_world[:3, 3] = renderer.scene.camera[0].pos
-                camera_x_ax = np.cross(
-                    renderer.scene.camera[0].up, -renderer.scene.camera[0].forward
-                )
+                cam_to_world[:3, 3] = camera_pos
+                camera_x_ax = np.cross(camera_up, -camera_forward)
                 cam_to_world[:3, :3] = np.column_stack(
-                    (camera_x_ax, renderer.scene.camera[0].up, -renderer.scene.camera[0].forward)
+                    (camera_x_ax, camera_up, -camera_forward)
                 )
                 assert np.allclose(cam_to_world[:3, 2], [0, 0, 1]), (
                     "Camera must be pointing straight down"
@@ -853,11 +851,10 @@ class iTHORMap(ProcTHORMap):
                 model, width=w, height=h, device_id=device_id, use_filament=use_filament
             )
             renderer.update(data, cam)
-            for camera in renderer.scene.camera:
-                camera: mujoco.MjvGLCamera
-                camera.orthographic = 1
-                camera.frustum_bottom = -aabb_size[0] / 2
-                camera.frustum_top = aabb_size[0] / 2
+            renderer.set_scene_camera_orthographic_frustum(
+                frustum_bottom=-aabb_size[0] / 2,
+                frustum_top=aabb_size[0] / 2,
+            )
         else:
             cam_model = model.cam(camera)
             assert model.cam_orthographic[cam_model.id], "Camera must be orthographic"
@@ -868,12 +865,11 @@ class iTHORMap(ProcTHORMap):
             )
             renderer.update(data, camera)
 
+        camera_pos, camera_forward, camera_up = renderer.first_scene_camera_transform()
         cam_to_world = np.eye(4)
-        cam_to_world[:3, 3] = renderer.scene.camera[0].pos
-        camera_x_ax = np.cross(renderer.scene.camera[0].up, -renderer.scene.camera[0].forward)
-        cam_to_world[:3, :3] = np.column_stack(
-            (camera_x_ax, renderer.scene.camera[0].up, -renderer.scene.camera[0].forward)
-        )
+        cam_to_world[:3, 3] = camera_pos
+        camera_x_ax = np.cross(camera_up, -camera_forward)
+        cam_to_world[:3, :3] = np.column_stack((camera_x_ax, camera_up, -camera_forward))
         assert np.allclose(cam_to_world[:3, 2], [0, 0, 1]), "Camera must be pointing straight down"
 
         renderer.enable_segmentation_rendering()
