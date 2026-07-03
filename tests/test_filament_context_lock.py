@@ -6,11 +6,17 @@ from unittest.mock import patch
 from molmo_spaces.utils.filament_context_lock import (
     filament_context_creation_lock,
     filament_context_free_lock,
+    flush_filament_context_frees,
+    pending_filament_context_frees,
     resolve_filament_lock_namespace,
+    schedule_filament_context_free,
 )
 
 
 class FilamentContextLockTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        flush_filament_context_frees(raise_errors=False)
+
     def test_resolver_uses_slot_zero_for_k1_under_drain_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -116,6 +122,80 @@ class FilamentContextLockTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 with filament_context_free_lock(None, "test-free"):
                     pass
+
+    def test_async_free_requires_drain_namespace(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        with patch.dict(os.environ, {"ALICE_MS_FIL_ASYNC_FREE": "1"}, clear=True):
+            self.assertFalse(
+                schedule_filament_context_free(
+                    ctx, {"free_drain_enabled": False}, "test-free",
+                )
+            )
+            self.assertFalse(ctx.freed)
+
+    def test_async_free_flushes_fake_context(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        with patch.dict(
+            os.environ,
+            {
+                "ALICE_MS_FIL_ASYNC_FREE": "1",
+                "ALICE_MS_FIL_ASYNC_FREE_MAX_PENDING": "1",
+            },
+            clear=True,
+        ):
+            self.assertTrue(
+                schedule_filament_context_free(
+                    ctx, {"free_drain_enabled": True, "enabled": False}, "test-free",
+                )
+            )
+            self.assertIn(pending_filament_context_frees(), (0, 1))
+            self.assertGreaterEqual(flush_filament_context_frees(), 0)
+            self.assertTrue(ctx.freed)
+            self.assertEqual(pending_filament_context_frees(), 0)
+
+    def test_creation_lock_flushes_pending_async_free(self) -> None:
+        class FakeContext:
+            def __init__(self) -> None:
+                self.freed = False
+
+            def free(self) -> None:
+                self.freed = True
+
+        ctx = FakeContext()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "ALICE_MOLMOSPACES_FILAMENT_RESET_LOCK": f"{tmp}/fil.lock",
+                "ALICE_MS_FIL_ASYNC_FREE": "1",
+                "ALICE_MS_FIL_ASYNC_FREE_MAX_PENDING": "1",
+                "ALICE_MS_FIL_FREE_DRAIN": "1",
+                "ALICE_MS_FIL_LOCK_SCOPE": "context",
+                "ALICE_MS_FIL_LOCK_SHARD": "1",
+                "ALICE_MS_FIL_RESET_CONCURRENCY": "1",
+                "ALICE_MS_FIL_LOCK_TIMEOUT_S": "1",
+                "CUDA_VISIBLE_DEVICES": "5",
+            },
+            clear=True,
+        ):
+            namespace = resolve_filament_lock_namespace()
+            self.assertTrue(schedule_filament_context_free(ctx, namespace, "test-free"))
+            with filament_context_creation_lock("test-create"):
+                self.assertTrue(ctx.freed)
+            self.assertEqual(pending_filament_context_frees(), 0)
 
 
 if __name__ == "__main__":

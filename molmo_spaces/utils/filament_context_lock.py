@@ -1,6 +1,8 @@
 import logging
 import os
+import threading
 import time
+import atexit
 from contextlib import contextmanager
 from typing import Any
 
@@ -15,6 +17,49 @@ _FILAMENT_CONTEXT_CONCURRENCY_DEFAULT = 2
 _FILAMENT_CONTEXT_LOCK_TIMEOUT_S = 240.0
 _FILAMENT_CONTEXT_ACTIVE_SCOPES = {"context", "mjr_context", "narrow"}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_ASYNC_FREE_TASKS: list["_AsyncFreeTask"] = []
+_ASYNC_FREE_ERRORS: list[BaseException] = []
+_ASYNC_FREE_TASKS_LOCK = threading.Lock()
+_ASYNC_FREE_ATEXIT_REGISTERED = False
+
+
+class _AsyncFreeTask:
+    def __init__(
+        self,
+        context: Any,
+        namespace: dict[str, Any] | None,
+        label: str,
+    ) -> None:
+        self.context = context
+        self.namespace = namespace
+        self.label = label
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"filament-async-free-{os.getpid()}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def join(self, timeout: float | None = None) -> bool:
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
+
+    def _run(self) -> None:
+        try:
+            _free_filament_context(
+                self.context,
+                self.namespace,
+                self.label,
+                async_free=True,
+            )
+        except BaseException as exc:  # noqa: BLE001 - propagate through flush.
+            self.error = exc
+            log.exception("Asynchronous Filament MjrContext.free failed")
+        finally:
+            self.context = None
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -53,6 +98,14 @@ def _flag_enabled(name: str) -> bool:
 
 def filament_free_drain_enabled() -> bool:
     return _flag_enabled("ALICE_MS_FIL_FREE_DRAIN")
+
+
+def filament_async_free_enabled() -> bool:
+    return _flag_enabled("ALICE_MS_FIL_ASYNC_FREE")
+
+
+def _async_free_max_pending() -> int:
+    return _positive_int_env("ALICE_MS_FIL_ASYNC_FREE_MAX_PENDING", 1)
 
 
 def resolve_filament_lock_namespace() -> dict[str, Any]:
@@ -378,6 +431,8 @@ def _drained_filament_context_creation_lock(label: str = "mjr_context"):
 
 @contextmanager
 def filament_context_creation_lock(label: str = "mjr_context"):
+    if filament_async_free_enabled():
+        flush_filament_context_frees()
     if not filament_free_drain_enabled():
         with _legacy_filament_context_creation_lock(label) as info:
             yield info
@@ -475,3 +530,137 @@ def filament_context_free_lock(namespace: dict[str, Any] | None, label: str = "m
         for lock_file in slot_files:
             lock_file.close()
         drain_file.close()
+
+
+def _free_filament_context(
+    context: Any,
+    namespace: dict[str, Any] | None,
+    label: str,
+    *,
+    async_free: bool,
+) -> None:
+    with filament_context_free_lock(namespace, label) as lock_info:
+        free_t0 = time.monotonic()
+        context.free()
+        free_s = time.monotonic() - free_t0
+    log.info(
+        "MS_FILAMENT_MJR_CONTEXT_FREE_TIMING gpu=%s slots=%s "
+        "wait_s=%.3f free_s=%.3f lock_hold_s=%.3f async=%d",
+        lock_info.get("gpu"),
+        lock_info.get("slots"),
+        float(lock_info.get("waited_s") or 0.0),
+        free_s,
+        float(lock_info.get("hold_s") or 0.0),
+        1 if async_free else 0,
+    )
+
+
+def _unfinished_async_tasks_locked() -> list[_AsyncFreeTask]:
+    return [task for task in _ASYNC_FREE_TASKS if task.thread.is_alive()]
+
+
+def _reap_async_tasks_locked() -> None:
+    unfinished = []
+    for task in _ASYNC_FREE_TASKS:
+        if task.thread.is_alive():
+            unfinished.append(task)
+        elif task.error is not None:
+            _ASYNC_FREE_ERRORS.append(task.error)
+    _ASYNC_FREE_TASKS[:] = unfinished
+
+
+def pending_filament_context_frees() -> int:
+    with _ASYNC_FREE_TASKS_LOCK:
+        _reap_async_tasks_locked()
+        return len(_ASYNC_FREE_TASKS)
+
+
+def flush_filament_context_frees(
+    *,
+    timeout_s: float | None = None,
+    raise_errors: bool = True,
+) -> int:
+    """Wait for all background MjrContext.free calls in this process.
+
+    This is the force-flush hook Alice should call before an offload boundary
+    returns GPU memory to the trainer and before process shutdown.
+    """
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    flushed = 0
+    errors: list[BaseException] = []
+    while True:
+        with _ASYNC_FREE_TASKS_LOCK:
+            _reap_async_tasks_locked()
+            errors.extend(_ASYNC_FREE_ERRORS)
+            _ASYNC_FREE_ERRORS.clear()
+            tasks = list(_ASYNC_FREE_TASKS)
+        if not tasks:
+            break
+        for task in tasks:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not task.join(remaining):
+                raise TimeoutError(
+                    "Timed out waiting for asynchronous Filament MjrContext.free"
+                )
+            flushed += 1
+            if task.error is not None:
+                errors.append(task.error)
+        with _ASYNC_FREE_TASKS_LOCK:
+            _ASYNC_FREE_TASKS[:] = [
+                task for task in _ASYNC_FREE_TASKS if task.thread.is_alive()
+            ]
+    with _ASYNC_FREE_TASKS_LOCK:
+        errors.extend(_ASYNC_FREE_ERRORS)
+        _ASYNC_FREE_ERRORS.clear()
+    if errors and raise_errors:
+        raise RuntimeError(
+            f"{len(errors)} asynchronous Filament MjrContext.free call(s) failed"
+        ) from errors[0]
+    if flushed:
+        log.info("MS_FILAMENT_ASYNC_FREE_FLUSH flushed=%d", flushed)
+    return flushed
+
+
+def _flush_filament_context_frees_at_exit() -> None:
+    try:
+        flush_filament_context_frees(raise_errors=False)
+    except Exception:
+        log.exception("Failed to flush asynchronous Filament frees at exit")
+
+
+def schedule_filament_context_free(
+    context: Any,
+    namespace: dict[str, Any] | None,
+    label: str = "mjr_context.free",
+) -> bool:
+    """Schedule MjrContext.free() on a bounded background lane.
+
+    Returns False when async free is disabled, so callers can fall back to the
+    exact synchronous path. The background task still uses
+    filament_context_free_lock(), preserving create/free exclusion.
+    """
+    if not filament_async_free_enabled():
+        return False
+    if namespace is None or not namespace.get("free_drain_enabled", False):
+        return False
+
+    global _ASYNC_FREE_ATEXIT_REGISTERED
+    max_pending = _async_free_max_pending()
+    while pending_filament_context_frees() >= max_pending:
+        flush_filament_context_frees()
+
+    task = _AsyncFreeTask(context, namespace, label)
+    with _ASYNC_FREE_TASKS_LOCK:
+        _ASYNC_FREE_TASKS.append(task)
+        pending = len(_ASYNC_FREE_TASKS)
+        if not _ASYNC_FREE_ATEXIT_REGISTERED:
+            atexit.register(_flush_filament_context_frees_at_exit)
+            _ASYNC_FREE_ATEXIT_REGISTERED = True
+    task.start()
+    log.info(
+        "MS_FILAMENT_ASYNC_FREE_SCHEDULED pending=%d max_pending=%d label=%s",
+        pending,
+        max_pending,
+        label,
+    )
+    return True
