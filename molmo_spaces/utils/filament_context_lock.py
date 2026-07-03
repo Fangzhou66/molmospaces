@@ -186,7 +186,11 @@ def _legacy_filament_context_creation_lock(label: str = "mjr_context"):
         "ALICE_MS_FIL_LOCK_TIMEOUT_S",
         _FILAMENT_CONTEXT_LOCK_TIMEOUT_S,
     )
-    paths = [lock_path] if slots == 1 else [f"{lock_path}.slot{i}" for i in range(slots)]
+    # M2 fix: ALWAYS use .slot{i} including K=1 -> .slot0, matching the
+    # resolver (slot_paths) so the legacy create path never aliases the bare
+    # base lock (which would (a) fail to mutually exclude a drained-K=1 run and
+    # (b) self-deadlock against Alice's outer lock on the same base path).
+    paths = [f"{lock_path}.slot{i}" for i in range(slots)]
     files = [open(path, "a+", encoding="utf-8") for path in paths]
 
     start = time.monotonic()
