@@ -8,9 +8,9 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 _FILAMENT_CONTEXT_LOCK_PATH = "/tmp/alice_molmospaces_filament_reset.lock"
-# Real B1 rollout rig on GPU0-3 (model GPU0, 48 Filament engines on GPU1-3):
-# K=1 11.0 steps/s, K=2 14.4 steps/s, K=3 11.9 steps/s. K=2 overlaps
-# lock-free CPU asset prep with the driver write-lock phase without over-contending.
+# Historical B1 probe default. Current Alice filament rollout regimes inject
+# ALICE_MS_FIL_RESET_CONCURRENCY explicitly (K=4 as of the 2026-07 speed
+# posture); do not treat this package fallback as a current optimum.
 _FILAMENT_CONTEXT_CONCURRENCY_DEFAULT = 2
 _FILAMENT_CONTEXT_LOCK_TIMEOUT_S = 240.0
 _FILAMENT_CONTEXT_ACTIVE_SCOPES = {"context", "mjr_context", "narrow"}
