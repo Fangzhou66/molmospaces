@@ -29,6 +29,42 @@ log = logging.getLogger(__name__)
 _PROCESS_TEXTURE_KEYS: set[str] = set()
 
 
+def _log_gpu_device_fds(label: str) -> None:
+    if os.environ.get("ALICE_MS_GPU_FD_TELEMETRY", "1").lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+    fd_root = f"/proc/{os.getpid()}/fd"
+    entries: list[str] = []
+    try:
+        for name in os.listdir(fd_root):
+            try:
+                target = os.readlink(os.path.join(fd_root, name))
+            except OSError:
+                continue
+            base = os.path.basename(target)
+            if base.startswith("nvidia") or base.startswith("renderD"):
+                entries.append(f"{name}:{target}")
+    except OSError as exc:
+        log.info("MS_GPU_DEVICE_FDS label=%s error=%r", label, exc)
+        return
+
+    entries.sort()
+    log.info(
+        "MS_GPU_DEVICE_FDS label=%s pid=%d cuda_visible_devices=%s "
+        "mujoco_egl_device_id=%s vk_uuid=%s fds=%s",
+        label,
+        os.getpid(),
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+        os.environ.get("MUJOCO_EGL_DEVICE_ID"),
+        os.environ.get("ALICE_VK_DEVICE_UUID"),
+        ";".join(entries) if entries else "none",
+    )
+
+
 def _model_cstring(chars, start: int) -> str:
     if start < 0:
         return ""
@@ -156,6 +192,7 @@ class MjFilamentRenderer(MjAbstractRenderer):
             context_t0 = time.monotonic()
             self._mjr_context = mj.MjrContext(model, mj.mjtFontScale.mjFONTSCALE_150.value)
             context_s = time.monotonic() - context_t0
+        _log_gpu_device_fds("after_mjr_context_create")
         self._filament_lock_namespace = lock_info.get("namespace")
         log.info(
             "MS_FILAMENT_MJR_CONTEXT_TIMING gpu=%s slots=%s slot=%s "
