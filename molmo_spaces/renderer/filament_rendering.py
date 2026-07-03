@@ -15,6 +15,7 @@ from molmo_spaces.renderer.abstract_renderer import MjAbstractRenderer
 from molmo_spaces.utils.filament_context_lock import (
     filament_context_creation_lock,
     filament_context_free_lock,
+    flush_filament_context_frees,
     schedule_filament_context_free,
 )
 
@@ -158,15 +159,32 @@ class _FilamentRendererActor:
                 try:
                     if op == "__close__":
                         t0 = time.monotonic()
-                        renderer.close()
-                        renderer = None
-                        log.info(
-                            "MS_FILAMENT_RENDERER_ACTOR_CLOSE_DONE close_s=%.3f",
-                            time.monotonic() - t0,
-                        )
-                        result_queue.put((True, None))
+                        try:
+                            renderer.close()
+                            flush_filament_context_frees()
+                            renderer = None
+                            log.info(
+                                "MS_FILAMENT_RENDERER_ACTOR_CLOSE_DONE close_s=%.3f",
+                                time.monotonic() - t0,
+                            )
+                            result_queue.put((True, None))
+                        except BaseException as exc:  # noqa: BLE001
+                            log.error(
+                                "MS_FILAMENT_RENDERER_ACTOR_CLOSE_FAILED\n%s",
+                                traceback.format_exc(),
+                            )
+                            result_queue.put((False, exc))
                         return
-                    result = getattr(renderer, op)(*args, **kwargs)
+                    target = getattr(renderer, op)
+                    if callable(target):
+                        result = target(*args, **kwargs)
+                    else:
+                        if args or kwargs:
+                            raise TypeError(
+                                f"Actor attribute {op!r} is not callable but "
+                                "arguments were provided"
+                            )
+                        result = target
                     result_queue.put((True, result))
                 except BaseException as exc:  # noqa: BLE001
                     log.error(
@@ -185,6 +203,7 @@ class _FilamentRendererActor:
             if renderer is not None:
                 try:
                     renderer.close()
+                    flush_filament_context_frees()
                 except BaseException:  # noqa: BLE001
                     log.error(
                         "MS_FILAMENT_RENDERER_ACTOR_FINAL_CLOSE_FAILED\n%s",
@@ -395,7 +414,11 @@ class MjFilamentRenderer(MjAbstractRenderer):
     @property
     def scene(self) -> mj.MjvScene:
         if getattr(self, "_actor_proxy", False):
-            return self._actor.call("scene")
+            raise RuntimeError(
+                "Direct scene access is disabled in Filament renderer actor "
+                "mode; use renderer scene helper methods so actor-owned "
+                "MjvScene state stays on the owner thread."
+            )
         return self._scene
 
     @property
