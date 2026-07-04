@@ -471,6 +471,16 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             cameras=camera_configs,
         )
 
+    def _model_cache_token(self) -> "str | None":
+        # Frozen benchmark episode: the pydantic dump captures every field
+        # that drives add_auxiliary_objects (scene_modifications etc.).
+        import hashlib
+
+        try:
+            return hashlib.sha256(self.episode_spec.model_dump_json().encode()).hexdigest()
+        except Exception:
+            return None
+
     def add_auxiliary_objects(self, spec: MjSpec) -> None:
         """Add objects from episode spec's scene_modifications.added_objects.
 

@@ -593,6 +593,7 @@ class BaseMujocoTaskSampler:
         scene_file_path,
         randomize_textures=False,
         environment_light_intensity: float = 15000.0,
+        cache_token: "str | None" = None,
     ):
         """
         Complete function to set up a scene with robot and objects.
@@ -604,6 +605,25 @@ class BaseMujocoTaskSampler:
         Returns:
             Compiled MuJoCo model
         """
+        # Compiled-model cache (MS_MJB_CACHE_DIR, default off): benchmark
+        # episodes are frozen, so the compiled model is a pure function of the
+        # inputs hashed below. Hit -> skip the whole spec build + compile.
+        _mc_key = None
+        if cache_token and not randomize_textures:
+            from molmo_spaces.utils import model_cache as _model_cache
+
+            if _model_cache.cache_dir():
+                _mc_key = _model_cache.model_cache_key(
+                    scene_file_path=str(scene_file_path),
+                    robot_xml_path=str(robot_config.get_robot_xml_path()),
+                    environment_light_intensity=environment_light_intensity,
+                    episode_token=cache_token,
+                    blacklist_token="|".join(sorted(get_static_asset_blacklist())),
+                )
+                _cached = _model_cache.load(_mc_key)
+                if _cached is not None:
+                    return _cached
+
         # Track XML/spec loading time
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("compile_xml_load")
@@ -743,7 +763,18 @@ class BaseMujocoTaskSampler:
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("compile_mujoco")
 
+        if _mc_key is not None:
+            from molmo_spaces.utils import model_cache as _model_cache
+
+            _model_cache.save(_mc_key, model)
+
         return model
+
+    def _model_cache_token(self) -> "str | None":
+        """Stable identity of everything task-specific that edits the spec
+        (add_auxiliary_objects etc.). None (default) disables the compiled-
+        model cache for this sampler; deterministic samplers override."""
+        return None
 
     def add_auxiliary_objects(self, spec: MjSpec | None) -> None:
         """Add add auxiliary objects to  a scene or make task specific model changes
@@ -824,6 +855,7 @@ class BaseMujocoTaskSampler:
                 randomize_textures=self.config.task_sampler_config.randomize_textures
                 or enable_door_randomization,  # Enable door joint randomization
                 environment_light_intensity=self.config.environment_light_intensity,
+                cache_token=self._model_cache_token(),
             )
         except HouseInvalidForTask:
             if self._datagen_profiler is not None:
