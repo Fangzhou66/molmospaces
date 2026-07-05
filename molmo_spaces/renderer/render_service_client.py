@@ -16,6 +16,7 @@ Protocol v1 slot shm layout (see render_service.cc):
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 import mmap
 import os
@@ -34,10 +35,48 @@ SLOT_BYTES = _PIX_OFF + _MAX_W * _MAX_H * 3
 
 TAG_ENV = "MS_RENDER_SERVICE_TAG"
 SLOT_ENV = "MS_RENDER_SERVICE_SLOT"
+TAGS_ENV = "MS_RENDER_SERVICE_TAGS"  # comma list: engines CLAIM a free slot
 
 
 def service_enabled() -> bool:
+    if os.environ.get(TAGS_ENV):
+        return True
     return bool(os.environ.get(TAG_ENV)) and os.environ.get(SLOT_ENV) is not None
+
+
+def claim_any_slot(nslots: int = 16, wait_s: float = 300.0):
+    """Claim a free slot on any advertised service via flock'd lockfiles.
+
+    Zero-coordination allocation for group-wide env vars (alice engine
+    processes share identical env). The claim is an flock held open for the
+    claimant's lifetime: the kernel drops it on ANY process death, so engine
+    crash/quarantine churn returns the slot as soon as the owner is gone
+    (O_EXCL claim files leaked slots permanently — canary 8757 deadlocked
+    on exactly that). Claim files are never unlinked while services run:
+    unlink+recreate would let two claimants lock different inodes.
+    """
+    tags = [t for t in os.environ[TAGS_ENV].split(",") if t]
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        for tag in tags:
+            for i in range(nslots):
+                shm = f"/dev/shm/msrender_{tag}_slot{i}"
+                if not os.path.exists(shm):
+                    continue
+                fd = os.open(shm + ".claim", os.O_CREAT | os.O_RDWR, 0o666)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    os.close(fd)
+                    continue
+                os.ftruncate(fd, 0)
+                os.write(fd, str(os.getpid()).encode())
+                log.info("claimed render-service slot %s/%d", tag, i)
+                s = RenderServiceSlot(tag=tag, slot=i)
+                s._claim_fd = fd
+                return s
+        time.sleep(1.0)
+    raise TimeoutError("no free render-service slot")
 
 
 class RenderServiceSlot:
@@ -54,6 +93,18 @@ class RenderServiceSlot:
         self._f = open(path, "r+b")
         self._m = mmap.mmap(self._f.fileno(), SLOT_BYTES)
         self.nstate: int | None = None
+        self._claim_fd: int | None = None
+
+    def release(self) -> None:
+        """Return the slot: closing the claim fd drops the flock."""
+        fd, self._claim_fd = self._claim_fd, None
+        try:
+            if fd is not None:
+                os.close(fd)
+            self._m.close()
+            self._f.close()
+        except Exception:
+            pass
 
     def _flag(self) -> int:
         return struct.unpack_from("<i", self._m, 0)[0]
@@ -76,18 +127,32 @@ class RenderServiceSlot:
         self._m[16:16 + len(b)] = b
         self._m[16 + len(b)] = 0
         self._set_flag(1)
-        if self._wait((5, 4), timeout_s) == 4:
-            raise RuntimeError(f"render service failed to load {model_path}")
+        t0 = time.monotonic()
+        while True:
+            f = self._flag()
+            if f == 5:
+                break
+            if f == 4:
+                raise RuntimeError(f"render service failed to load {model_path}")
+            if f == 3:
+                # Stale 'done' from the slot's previous (dead) owner: the
+                # server finished an in-flight render after our init write
+                # and clobbered the flag. Path bytes are untouched; re-issue.
+                self._set_flag(1)
+            if time.monotonic() - t0 > timeout_s:
+                raise TimeoutError(f"render service slot {self.slot}: flag={f}")
+            time.sleep(0.0002)
         self.nstate = struct.unpack_from("<i", self._m, 4)[0]
         log.info("render service slot %d ready (nstate=%d)", self.slot, self.nstate)
         return self.nstate
 
     def render_rgb(self, state: np.ndarray, cam10, width: int, height: int,
-                   derived_blob: bytes | None = None,
+                   derived_blob: bytes | None = None, segmentation: bool = False,
                    timeout_s: float = 60.0) -> np.ndarray:
         if width * height * 3 > _MAX_W * _MAX_H * 3:
             raise ValueError(f"resolution {width}x{height} exceeds protocol buffer")
-        cam12 = tuple(cam10) + (1.0 if derived_blob else 0.0, 0.0)
+        cam12 = tuple(cam10) + (1.0 if derived_blob else 0.0,
+                                1.0 if segmentation else 0.0)
         struct.pack_into("<12d", self._m, _CAM_OFF, *cam12)
         sb = state.tobytes()
         self._m[_STATE_OFF:_STATE_OFF + len(sb)] = sb

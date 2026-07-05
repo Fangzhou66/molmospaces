@@ -156,15 +156,34 @@ class MjFilamentRenderer(MjAbstractRenderer):
             try:
                 import tempfile as _tf
 
-                slot_id = int(os.environ[_rsc.SLOT_ENV])
+                if os.environ.get(_rsc.TAGS_ENV):
+                    self._service_slot = _rsc.claim_any_slot()
+                else:
+                    self._service_slot = _rsc.RenderServiceSlot()
                 mjb_dir = os.environ.get(
                     "MS_RENDER_SERVICE_MJB_DIR", _tf.gettempdir()
                 )
+                # Content-keyed, write-once transport: benchmark tasks share
+                # compiled models heavily (canary 8757: 96/96 resets saved a
+                # byte-identical 528MB mjb; the synchronized rebuild wave was
+                # a 16GB NFS burst -> 300s+ resets -> mass engine quarantine).
+                # Same key => same file => the server can skip reloading too.
+                import hashlib as _hl
+
+                _h = _hl.blake2b(digest_size=8)
+                _h.update(np.int64(mj.mj_sizeModel(model)).tobytes())
+                for _arr in (
+                    model.qpos0, model.body_pos, model.geom_pos,
+                    model.geom_size, model.tex_adr, model.mesh_vertadr,
+                ):
+                    _h.update(np.ascontiguousarray(_arr).tobytes())
                 mjb_path = os.path.join(
-                    mjb_dir, f"rsvc_slot{slot_id}_{os.getpid()}.mjb"
+                    mjb_dir, f"rsvc_sig_{_h.hexdigest()}.mjb"
                 )
-                mj.mj_saveModel(model, mjb_path, None)
-                self._service_slot = _rsc.RenderServiceSlot()
+                if not os.path.exists(mjb_path):
+                    _tmp = f"{mjb_path}.tmp.{os.getpid()}"
+                    mj.mj_saveModel(model, _tmp, None)
+                    os.replace(_tmp, mjb_path)
                 self._service_slot.init_model(mjb_path)
             except Exception:
                 log.exception("render service init failed; using local renderer")
@@ -334,7 +353,12 @@ class MjFilamentRenderer(MjAbstractRenderer):
                 )
 
         # Render scene and read contents of RGB and depth buffers.
-        mj.mjr_render(rect, self._scene, self._mjr_context)
+        if self._mjr_context is not None:
+            mj.mjr_render(rect, self._scene, self._mjr_context)
+        elif self._depth_rendering:
+            raise NotImplementedError(
+                "depth rendering via the render service is not supported yet"
+            )
 
         if self._depth_rendering:
             mj.mjr_readPixels(rgb=None, depth=out, viewport=rect, con=self._mjr_context)
@@ -373,7 +397,22 @@ class MjFilamentRenderer(MjAbstractRenderer):
             # Reset scene flags.
             np.copyto(self._scene.flags, original_flags)
         elif self._segmentation_rendering:
-            mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
+            if self._mjr_context is not None:
+                mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
+            else:
+                from molmo_spaces.renderer import render_service_client as _rsc
+
+                ns = self._service_slot.nstate
+                state = np.zeros(ns)
+                mj.mj_getState(
+                    self._model, self._service_last_data, state,
+                    mj.mjtState.mjSTATE_INTEGRATION,
+                )
+                cam10 = _rsc.camera_to_cam10(self._service_last_camera, width, height)
+                blob = _rsc.derived_blob_from_data(self._model, self._service_last_data)
+                out[...] = self._service_slot.render_rgb(
+                    state, cam10, width, height, derived_blob=blob, segmentation=True
+                )
 
             # Convert 3-channel uint8 to 1-channel uint32.
             image3 = out.astype(np.uint32)
@@ -530,6 +569,12 @@ class MjFilamentRenderer(MjAbstractRenderer):
         )
 
     def close(self) -> None:
+        if getattr(self, "_service_slot", None) is not None:
+            # Release the render-service claim synchronously: a rebuild wave
+            # where every engine holds its old slot until GC while claiming a
+            # new one would exhaust the pool.
+            self._service_slot.release()
+            self._service_slot = None
         if hasattr(self, "_mjr_context") and self._mjr_context:
             with filament_context_free_lock(
                 getattr(self, "_filament_lock_namespace", None),
