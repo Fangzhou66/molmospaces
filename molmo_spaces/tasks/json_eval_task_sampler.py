@@ -477,7 +477,13 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         import hashlib
 
         try:
-            return hashlib.sha256(self.episode_spec.model_dump_json().encode()).hexdigest()
+            token = self.episode_spec.model_dump_json()
+            # Belt-and-suspenders: fold in any source/sampler-level config that
+            # could influence the spec beyond the episode itself (e.g. camera
+            # alias selections, sampler options). repr of the task sampler
+            # config is stable for a fixed yaml.
+            token += "|" + repr(getattr(self.config, "task_sampler_config", ""))
+            return hashlib.sha256(token.encode()).hexdigest()
         except Exception:
             return None
 

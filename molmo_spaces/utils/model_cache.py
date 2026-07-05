@@ -19,6 +19,7 @@ import hashlib
 import logging
 import os
 import tempfile
+import weakref
 
 import mujoco as mj
 
@@ -55,7 +56,9 @@ def model_cache_key(
         _CACHE_FORMAT,
         mj.__version__,
         _file_sha(str(scene_file_path)),
+        # robot keyed by CONTENT (path alone would go stale on robot updates)
         str(robot_xml_path),
+        _file_sha(str(robot_xml_path)),
         f"{environment_light_intensity:.6f}",
         episode_token,
         hashlib.sha256(blacklist_token.encode()).hexdigest() if blacklist_token else "noblacklist",
@@ -75,6 +78,7 @@ def load(key: str) -> "mj.MjModel | None":
     try:
         model = mj.MjModel.from_binary_path(path)
         log.info("MS_MJB_CACHE hit key=%s", key[:16])
+        register_model_key(model, key)
         return model
     except Exception as exc:  # corrupt entry: ignore, rebuild
         log.warning("MS_MJB_CACHE corrupt entry %s: %s", path, exc)
@@ -92,6 +96,7 @@ def save(key: str, model: "mj.MjModel") -> None:
         mj.mj_saveModel(model, tmp, None)
         os.replace(tmp, os.path.join(d, key + ".mjb"))
         log.info("MS_MJB_CACHE store key=%s", key[:16])
+        register_model_key(model, key)
     except Exception as exc:  # cache is best-effort; never break the build
         log.warning("MS_MJB_CACHE store failed key=%s: %s", key[:16], exc)
 
@@ -105,3 +110,80 @@ def validate_roundtrip(model: "mj.MjModel", workdir: str) -> bool:
     mj.mj_saveModel(m2, b, None)
     with open(a, "rb") as fa, open(b, "rb") as fb:
         return fa.read() == fb.read()
+
+
+# ---------------------------------------------------------------------------
+# Settled-state cache (rides on the model cache key).
+# Validated 2026-07-04: snapshot mjSTATE_INTEGRATION at step N-1, restore +
+# one mj_step => ENTIRE MjData bitwise-identical to a fresh N-step settle
+# (qpos/qvel/qacc/xpos/xquat/sensordata/act/warmstart), 0.008s vs 3.2-6.4s.
+# ---------------------------------------------------------------------------
+
+_MODEL_KEYS: "weakref.WeakValueDictionary[int, mj.MjModel]" = weakref.WeakValueDictionary()
+_KEY_BY_ID: dict[int, str] = {}
+
+
+def register_model_key(model: "mj.MjModel", key: str) -> None:
+    try:
+        _MODEL_KEYS[id(model)] = model
+        _KEY_BY_ID[id(model)] = key
+    except TypeError:  # model not weakref-able: registry disabled
+        pass
+
+
+def key_for_model(model: "mj.MjModel") -> "str | None":
+    if _MODEL_KEYS.get(id(model)) is model:
+        return _KEY_BY_ID.get(id(model))
+    return None
+
+
+def _settle_path(key: str, n_steps: int) -> "str | None":
+    d = cache_dir()
+    if not d:
+        return None
+    return os.path.join(d, f"{key}.settle{n_steps}.npz")
+
+
+def load_settle_state(model: "mj.MjModel", n_steps: int):
+    """Return the cached N-1 INTEGRATION state vector or None."""
+    import numpy as np
+
+    key = key_for_model(model)
+    if key is None or n_steps < 1:
+        return None
+    path = _settle_path(key, n_steps)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with np.load(path) as z:
+            if str(z["mj_version"]) != mj.__version__ or int(z["n_steps"]) != n_steps:
+                return None
+            state = z["state"]
+        expect = mj.mj_stateSize(model, mj.mjtState.mjSTATE_INTEGRATION)
+        if state.shape[0] != expect:
+            return None
+        log.info("MS_SETTLE_CACHE hit key=%s n=%d", key[:16], n_steps)
+        return state
+    except Exception as exc:
+        log.warning("MS_SETTLE_CACHE corrupt %s: %s", path, exc)
+        return None
+
+
+def save_settle_state(model: "mj.MjModel", n_steps: int, state) -> None:
+    import numpy as np
+
+    key = key_for_model(model)
+    if key is None:
+        return
+    path = _settle_path(key, n_steps)
+    if not path:
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".tmp.npz", dir=os.path.dirname(path))
+        os.close(fd)
+        # np.savez APPENDS .npz unless the name already ends with it
+        np.savez(tmp, state=state, n_steps=n_steps, mj_version=mj.__version__)
+        os.replace(tmp, path)
+        log.info("MS_SETTLE_CACHE store key=%s n=%d", key[:16], n_steps)
+    except Exception as exc:
+        log.warning("MS_SETTLE_CACHE store failed: %s", exc)

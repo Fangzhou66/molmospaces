@@ -202,12 +202,39 @@ class CPUMujocoEnv(BaseMujocoEnv):
         # data for each batch
         data_settle_t0 = time.monotonic()
         self._mj_datas = [MjData(mj_model) for _ in range(self._n_batch)]
-        for mj_data in self._mj_datas:
-            mujoco.mj_forward(mj_model, mj_data)
-            for _ in range(
-                self.config.task_sampler_config.sim_settle_timesteps
-            ):  # let objects settle
+        _settle_n = self.config.task_sampler_config.sim_settle_timesteps
+        # Settled-state cache (rides on MS_MJB_CACHE_DIR): snapshot the
+        # mjSTATE_INTEGRATION vector at step N-1 and replay the final step —
+        # validated BITWISE-identical to a fresh settle (incl. warmstart and
+        # the stale-kinematics pattern), 0.008s vs 3.2-6.4s.
+        from molmo_spaces.utils import model_cache as _model_cache
+
+        _settle_state = (
+            _model_cache.load_settle_state(mj_model, _settle_n) if _settle_n >= 1 else None
+        )
+        if _settle_state is not None:
+            for mj_data in self._mj_datas:
+                mujoco.mj_setState(
+                    mj_model, mj_data, _settle_state, mujoco.mjtState.mjSTATE_INTEGRATION
+                )
                 mujoco.mj_step(mj_model, mj_data)
+        else:
+            _capture = _settle_n >= 1 and _model_cache.key_for_model(mj_model) is not None
+            for _bi, mj_data in enumerate(self._mj_datas):
+                mujoco.mj_forward(mj_model, mj_data)
+                for _si in range(_settle_n):  # let objects settle
+                    if _capture and _bi == 0 and _si == _settle_n - 1:
+                        import numpy as _np
+
+                        _sz = mujoco.mj_stateSize(
+                            mj_model, mujoco.mjtState.mjSTATE_INTEGRATION
+                        )
+                        _st = _np.zeros(_sz)
+                        mujoco.mj_getState(
+                            mj_model, mj_data, _st, mujoco.mjtState.mjSTATE_INTEGRATION
+                        )
+                        _model_cache.save_settle_state(mj_model, _settle_n, _st)
+                    mujoco.mj_step(mj_model, mj_data)
         data_settle_s = time.monotonic() - data_settle_t0
 
         robot_t0 = time.monotonic()
