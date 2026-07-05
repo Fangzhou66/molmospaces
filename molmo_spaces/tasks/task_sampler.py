@@ -809,6 +809,8 @@ class BaseMujocoTaskSampler:
         if scene_path is None:
             scene_path = self._current_house_scene_path()
 
+        _update_scene_t0 = time.monotonic()
+
         # If using a MolmoSpaces scene, install it
         if get_scenes_root().resolve() in Path(scene_path).resolve().parents:
             # Track asset installation time (fetching/extracting scene, objects, grasps)
@@ -878,6 +880,15 @@ class BaseMujocoTaskSampler:
                 "MS_FILAMENT_SCENE_COMPILE_TIMING path=%s compile_s=%.3f",
                 scene_path,
                 scene_compile_s,
+            )
+            # Cold-phase decomposition (2026-07-05): update_scene total =
+            # asset install + scene build/compile-or-cache-load; the gap vs
+            # compile_s is the install/fetch share.
+            log.info(
+                "MS_COLD_PHASE update_scene_s=%.3f scene_compile_s=%.3f path=%s",
+                time.monotonic() - _update_scene_t0,
+                scene_compile_s,
+                scene_path,
             )
 
         # Create new environment around new model
@@ -1236,11 +1247,17 @@ class BaseMujocoTaskSampler:
         # Time task-specific sampling (object selection, robot placement, camera setup, etc.)
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("task_specific_sample")
+        _sample_t0 = time.monotonic()
         try:
             task = self._sample_task(self.env)
         finally:
             if self._datagen_profiler is not None:
                 self._datagen_profiler.end("task_specific_sample")
+            if getattr(mujoco, "mjRENDERER", "classic") == "filament":
+                log.info(
+                    "MS_COLD_PHASE task_specific_sample_s=%.3f",
+                    time.monotonic() - _sample_t0,
+                )
 
         # Update robot-mounted camera poses to ensure they reflect the final robot state.
         # This is needed because camera setup may happen before the final mj_forward call,
