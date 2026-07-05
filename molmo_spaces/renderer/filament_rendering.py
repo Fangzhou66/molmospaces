@@ -142,11 +142,53 @@ class MjFilamentRenderer(MjAbstractRenderer):
         self._scene = mj.MjvScene(model=model, maxgeom=max_geom)
         self._scene_option = mj.MjvOption()
 
+        # Render-service routing (MS_RENDER_SERVICE_TAG/SLOT): plain-RGB
+        # renders go to the per-GPU consolidated service (2026-07-05 audit:
+        # cross-process Vulkan contention capped filament at ~16 renders/s/
+        # GPU; the service is ~9-10x and pixmatch=1.000000). Depth/
+        # segmentation and any failure fall back to the local context.
+        self._service_slot = None
+        self._service_last_data = None
+        self._service_last_camera = None
+        from molmo_spaces.renderer import render_service_client as _rsc
+
+        if _rsc.service_enabled():
+            try:
+                import tempfile as _tf
+
+                slot_id = int(os.environ[_rsc.SLOT_ENV])
+                mjb_dir = os.environ.get(
+                    "MS_RENDER_SERVICE_MJB_DIR", _tf.gettempdir()
+                )
+                mjb_path = os.path.join(
+                    mjb_dir, f"rsvc_slot{slot_id}_{os.getpid()}.mjb"
+                )
+                mj.mj_saveModel(model, mjb_path, None)
+                self._service_slot = _rsc.RenderServiceSlot()
+                self._service_slot.init_model(mjb_path)
+            except Exception:
+                log.exception("render service init failed; using local renderer")
+                self._service_slot = None
+
         # Turn off site rendering
         self._scene_option.sitegroup *= 0
 
         # Enable shadow rendering by default (shadows are controlled by lights with castshadow enabled)
         self._scene.flags[mj.mjtRndFlag.mjRND_SHADOW] = True
+
+        if self._service_slot is not None:
+            # Service owns the filament context for this slot; the engine
+            # process touches no Vulkan at all (no per-engine context, no
+            # arena pressure, no cross-process driver contention).
+            self._mjr_context = None
+            self._depth_rendering = False
+            self._segmentation_rendering = False
+            self._textures_need_upload = False
+            log.info(
+                "MS_RENDER_SERVICE active (slot %s): local MjrContext skipped",
+                os.environ.get("MS_RENDER_SERVICE_SLOT"),
+            )
+            return
 
         _log_texture_cache_potential(model)
         with filament_context_creation_lock("MjFilamentRenderer.MjrContext") as lock_info:
@@ -219,6 +261,38 @@ class MjFilamentRenderer(MjAbstractRenderer):
     ) -> np.ndarray:
         height = height or self._height
         width = width or self._width
+
+        if (
+            self._service_slot is not None
+            and not self._depth_rendering
+            and not self._segmentation_rendering
+            and self._service_last_data is not None
+        ):
+            try:
+                from molmo_spaces.renderer import render_service_client as _rsc
+
+                ns = self._service_slot.nstate
+                state = np.zeros(ns)
+                mj.mj_getState(
+                    self._model, self._service_last_data, state,
+                    mj.mjtState.mjSTATE_INTEGRATION,
+                )
+                cam10 = _rsc.camera_to_cam10(
+                    self._service_last_camera, width, height
+                )
+                blob = _rsc.derived_blob_from_data(
+                    self._model, self._service_last_data
+                )
+                px = self._service_slot.render_rgb(
+                    state, cam10, width, height, derived_blob=blob
+                )
+                if out is None:
+                    return px.copy()
+                out[...] = px
+                return out
+            except Exception:
+                log.exception("render service call failed; falling back local")
+
         rect = mj.MjrRect(0, 0, width, height)
 
         original_flags = self._scene.flags.copy()
@@ -440,6 +514,9 @@ class MjFilamentRenderer(MjAbstractRenderer):
                 mj.mjv_defaultFreeCamera(self.model, camera)
             else:
                 camera.type = mj.mjtCamera.mjCAMERA_FIXED
+
+        self._service_last_data = data
+        self._service_last_camera = camera
 
         scene_option = scene_option or self._scene_option
         mj.mjv_updateScene(
