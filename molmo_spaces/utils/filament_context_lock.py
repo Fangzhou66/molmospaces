@@ -386,10 +386,78 @@ def filament_context_creation_lock(label: str = "mjr_context"):
         yield info
 
 
+_FREE_SLOT_ENV = "ALICE_MS_FIL_FREE_CONCURRENCY"
+
+
+def _free_concurrency() -> int:
+    """K_free >= 1 paces MjrContext.free() with K dedicated slots per GPU
+    WITHOUT touching create slots (unlike FREE_DRAIN which blocks creates).
+    0/unset = unlimited (the 2026-07-05 free-storm regime)."""
+    raw = os.environ.get(_FREE_SLOT_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        log.warning("%s=%r is not an integer; ignoring", _FREE_SLOT_ENV, raw)
+        return 0
+
+
+def _acquire_any_slot(files, deadline: float, label: str) -> int:
+    import fcntl
+
+    while True:
+        for i, f in enumerate(files):
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return i
+            except BlockingIOError:
+                continue
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"filament free-slot acquisition timed out ({label})")
+        time.sleep(0.05)
+
+
 @contextmanager
 def filament_context_free_lock(namespace: dict[str, Any] | None, label: str = "mjr_context.free"):
     """Serialize MjrContext.free() against all in-flight context creates."""
     if namespace is not None and not namespace.get("free_drain_enabled", False):
+        kfree = _free_concurrency()
+        if kfree >= 1:
+            # Paced free (2026-07-05 free-storm fix): concurrent 10-13s Engine
+            # teardowns stampede the driver (close_ms 11->35s when caches
+            # synchronize rebuilds). K_free slots serialize frees only.
+            timeout_s = _positive_float_env(
+                "ALICE_MS_FIL_LOCK_TIMEOUT_S", _FILAMENT_CONTEXT_LOCK_TIMEOUT_S
+            )
+            deadline = time.monotonic() + timeout_s
+            base = str(namespace.get("path") or _FILAMENT_CONTEXT_LOCK_PATH)
+            files = [_open_lock_file(f"{base}.freeslot{i}") for i in range(kfree)]
+            start = time.monotonic()
+            idx = _acquire_any_slot(files, deadline, label)
+            waited = time.monotonic() - start
+            try:
+                yield {
+                    "enabled": True,
+                    "op": "free-paced",
+                    "waited_s": waited,
+                    "hold_s": 0.0,
+                    "slot": idx,
+                    "slots": kfree,
+                    "gpu": namespace.get("gpu"),
+                    "path": base,
+                    "label": label,
+                    "namespace": namespace,
+                }
+            finally:
+                import fcntl
+
+                try:
+                    fcntl.flock(files[idx].fileno(), fcntl.LOCK_UN)
+                finally:
+                    for f in files:
+                        f.close()
+            return
         yield {
             "enabled": False,
             "op": "free",
