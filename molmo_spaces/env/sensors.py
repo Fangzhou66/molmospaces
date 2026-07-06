@@ -935,14 +935,38 @@ class ObjectImagePointsSensor(Sensor):
             log.warning("Environment does not support segmentation masks")
             return result
 
+        # MS_SEG_RENDER_ONCE=1: render each camera's segmentation frame ONCE
+        # per step and decode every object from it (frames are object-
+        # independent; per-object re-renders were 89-98% of rollout render
+        # demand). Loop nesting and per-pair visit order are preserved so the
+        # np.random point-sampling stream — and therefore the emitted bytes —
+        # are identical to the legacy path.
+        import os as _os
+
+        _seg_once = _os.environ.get("MS_SEG_RENDER_ONCE") == "1" and hasattr(
+            env, "get_segmentation_masks_for_objects"
+        )
+        _cam_masks: dict = {}
+
         # Process each object
         for obj_key, obj_name in object_names.items():
             for camera_name in self.camera_names:
                 try:
                     # Get segmentation mask for the target object
-                    segmentation_mask = env.get_segmentation_mask_of_object(
-                        obj_name, camera_name=camera_name, batch_index=batch_index
-                    )
+                    if _seg_once:
+                        if camera_name not in _cam_masks:
+                            _cam_masks[camera_name] = (
+                                env.get_segmentation_masks_for_objects(
+                                    list(object_names.values()),
+                                    camera_name,
+                                    batch_index=batch_index,
+                                )
+                            )
+                        segmentation_mask = _cam_masks[camera_name].get(obj_name)
+                    else:
+                        segmentation_mask = env.get_segmentation_mask_of_object(
+                            obj_name, camera_name=camera_name, batch_index=batch_index
+                        )
 
                     if segmentation_mask is None or not np.any(segmentation_mask > 0):
                         # Keep empty result (already initialized with NaN/0)

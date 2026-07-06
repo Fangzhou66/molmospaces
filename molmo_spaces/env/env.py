@@ -515,6 +515,37 @@ class CPUMujocoEnv(BaseMujocoEnv):
             # Restore previous batch index
             self.current_batch_index = prev_batch_index
 
+    def get_segmentation_masks_for_objects(
+        self, object_names: list[str], camera_name: str, batch_index: int = 0
+    ) -> dict[str, np.ndarray | None]:
+        """Render ONE segmentation frame and decode a mask per object.
+
+        The frame is object-independent (generic segmentation; per-object
+        content lives in the decode), so one render serves every object —
+        the per-(object, camera) re-render in ObjectImagePointsSensor was
+        89-98% of rollout render demand (density audit 2026-07-06).
+        Decode semantics match get_segmentation_mask_of_object exactly.
+        """
+        prev_batch_index = self.current_batch_index
+        try:
+            self.current_batch_index = batch_index
+            model = self.current_model
+            seg_frame = self.render_segmentation_frame(camera_name)
+            masks: dict[str, np.ndarray | None] = {}
+            for object_name in object_names:
+                try:
+                    body_id = model.body(object_name).id
+                except KeyError:
+                    log.warning(f"Object '{object_name}' not found in model")
+                    masks[object_name] = None
+                    continue
+                masks[object_name] = get_geom_seg_mask(
+                    model, seg_frame[..., :2], body_id
+                ).astype(bool)
+            return masks
+        finally:
+            self.current_batch_index = prev_batch_index
+
     def check_visibility(self, camera_name: str, *target_objects) -> float | dict[str, float]:
         """
         Check visibility of one or more target objects from a specific camera.
