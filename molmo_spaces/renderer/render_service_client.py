@@ -44,7 +44,7 @@ def service_enabled() -> bool:
     return bool(os.environ.get(TAG_ENV)) and os.environ.get(SLOT_ENV) is not None
 
 
-def claim_any_slot(nslots: int = 16, wait_s: float = 300.0):
+def claim_any_slot(nslots: int | None = None, wait_s: float = 300.0):
     """Claim a free slot on any advertised service via flock'd lockfiles.
 
     Zero-coordination allocation for group-wide env vars (alice engine
@@ -55,6 +55,8 @@ def claim_any_slot(nslots: int = 16, wait_s: float = 300.0):
     on exactly that). Claim files are never unlinked while services run:
     unlink+recreate would let two claimants lock different inodes.
     """
+    if nslots is None:
+        nslots = int(os.environ.get("MS_RENDER_SERVICE_NSLOTS", "16"))
     tags = [t for t in os.environ[TAGS_ENV].split(",") if t]
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
