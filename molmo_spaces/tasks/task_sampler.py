@@ -64,12 +64,27 @@ def _normalize_render_service_xml(root: ET.Element) -> None:
             elem.set("gridlayout", layout[:expected])
 
 
+def _collapse_path_parts(path: Path) -> Path:
+    parts: list[str] = []
+    for part in path.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            else:
+                parts.append(part)
+            continue
+        parts.append(part)
+    return Path(*parts) if parts else Path()
+
+
 def _cache_relative_path(path: Path) -> Path | None:
     parts = path.parts
     for i in range(len(parts) - 1):
         if parts[i] == ".cache" and parts[i + 1] == "molmo-spaces-resources":
             rel_parts = parts[i + 2 :]
-            return Path(*rel_parts) if rel_parts else Path()
+            return _collapse_path_parts(Path(*rel_parts)) if rel_parts else Path()
     return None
 
 
