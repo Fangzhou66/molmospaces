@@ -122,7 +122,7 @@ class RenderServiceSlot:
             time.sleep(0.0002)
         return self._flag()
 
-    def init_model(self, model_path: str, timeout_s: float = 900.0) -> int:
+    def init_model(self, model_path: str, timeout_s: float = 180.0) -> int:
         b = model_path.encode()
         if len(b) > 1000:
             raise ValueError("model path too long for protocol v1")

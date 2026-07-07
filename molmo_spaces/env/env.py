@@ -20,6 +20,7 @@ from molmo_spaces.env.data_views import (
     create_mlspaces_body,
 )
 from molmo_spaces.renderer.abstract_renderer import MjAbstractRenderer
+from molmo_spaces.env.mj_extensions import MjModelBindings
 from molmo_spaces.renderer.filament_rendering import MjFilamentRenderer
 from molmo_spaces.renderer.opengl_rendering import MjOpenGLRenderer
 from molmo_spaces.robots.abstract import Robot
@@ -150,6 +151,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         robot_factory: Callable[[MjData], Robot],
         mj_model: MjModel,
         mj_base_scene_path: str,
+        mj_service_xml_path: str | None = None,
         parallelize: bool = True,
     ) -> None:
         super().__init__(exp_config, mj_model)
@@ -164,6 +166,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         self._robots = None
         self._executor = None
         self._mj_base_scene_path = None
+        self._mj_service_xml_path = mj_service_xml_path
         self._scene_metadata = None
 
         self.camera_manager = CameraManager()
@@ -251,7 +254,17 @@ class CPUMujocoEnv(BaseMujocoEnv):
         renderer_t0 = time.monotonic()
         if HAS_FILAMENT:
             log.info("Using MuJoCo renderer: filament")
-            self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
+            if self._mj_service_xml_path:
+                bindings = MjModelBindings.from_xml_path(
+                    self.mj_model, self._mj_service_xml_path
+                )
+                self._renderer = MjFilamentRenderer(
+                    model_bindings=bindings, width=width, height=height
+                )
+            else:
+                self._renderer = MjFilamentRenderer(
+                    model=self.mj_model, width=width, height=height
+                )
         else:
             log.info("Using MuJoCo renderer: classic")
             self._renderer = MjOpenGLRenderer(model=self.mj_model, width=width, height=height)

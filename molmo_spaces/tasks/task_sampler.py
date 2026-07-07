@@ -8,6 +8,7 @@ Subclasses of AbstractMujocoTaskSampler should implement the _sample_task method
 """
 
 import logging
+import hashlib
 import math
 import os
 import random
@@ -21,6 +22,7 @@ import mujoco
 import numpy as np
 import torch
 from mujoco import MjData, MjSpec
+from xml.etree import ElementTree as ET
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.env.arena.arena_utils import get_all_bodies_with_joints_as_mlspaces_objects
@@ -39,6 +41,40 @@ from molmo_spaces.molmo_spaces_constants import (
 
 MJC_VERSION = tuple(map(int, mujoco.__version__.split(".")))
 FILAMENT_ATTR_ENV_LIGHT_INTENSITY = "filament.fallback.environment_light_intensity"
+
+
+def _render_service_xml_enabled() -> bool:
+    return os.environ.get("MS_RENDER_SERVICE_TRANSPORT", "").lower() == "xmlfile"
+
+
+def _stage_render_service_xml(spec: MjSpec, scene_file_path) -> str:
+    scene_dir = Path(scene_file_path).resolve().parent
+    xml_text = spec.to_xml()
+    root = ET.fromstring(xml_text)
+
+    for elem in root.iter():
+        if "file" in elem.attrib:
+            path = Path(elem.attrib["file"])
+            if not path.is_absolute():
+                elem.set("file", str((scene_dir / path).resolve()))
+        if elem.tag == "compiler":
+            for attr in ("assetdir", "meshdir", "texturedir"):
+                value = elem.attrib.get(attr)
+                if value:
+                    path = Path(value)
+                    if not path.is_absolute():
+                        elem.set(attr, str((scene_dir / path).resolve()))
+
+    staged = ET.tostring(root, encoding="utf-8")
+    digest = hashlib.blake2b(staged, digest_size=12).hexdigest()
+    stage_dir = Path(os.environ.get("MS_RENDER_SERVICE_MJB_DIR", "/tmp"))
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    path = stage_dir / f"rsvc_xml_{digest}.xml"
+    if not path.exists():
+        tmp = path.with_suffix(f".xml.tmp.{os.getpid()}")
+        tmp.write_bytes(staged)
+        os.replace(tmp, path)
+    return str(path)
 
 
 from contextlib import contextmanager
@@ -330,6 +366,7 @@ class BaseMujocoTaskSampler:
         # Environment will be created lazily when first accessed
         self._env = None
         self.current_seed = None
+        self._last_render_service_xml_path: str | None = None
 
         # Shared metadata adder for all dynamically-added objects
         self._metadata_adder = MetadataAdder()
@@ -609,7 +646,9 @@ class BaseMujocoTaskSampler:
         # episodes are frozen, so the compiled model is a pure function of the
         # inputs hashed below. Hit -> skip the whole spec build + compile.
         _mc_key = None
-        if cache_token and not randomize_textures:
+        self._last_render_service_xml_path = None
+        use_service_xml = _render_service_xml_enabled()
+        if cache_token and not randomize_textures and not use_service_xml:
             from molmo_spaces.utils import model_cache as _model_cache
 
             if _model_cache.cache_dir():
@@ -722,6 +761,11 @@ class BaseMujocoTaskSampler:
         from molmo_spaces.utils.scene_maps import _delete_blacklisted_bodies
 
         _delete_blacklisted_bodies(spec)
+
+        if use_service_xml:
+            self._last_render_service_xml_path = _stage_render_service_xml(
+                spec, scene_file_path
+            )
 
         # Compile and return the model
         try:
@@ -904,6 +948,7 @@ class BaseMujocoTaskSampler:
             robot_factory=self._create_robot,
             mj_model=model,
             mj_base_scene_path=scene_path,
+            mj_service_xml_path=self._last_render_service_xml_path,
         )
         env_create_s = time.monotonic() - env_create_t0
         if self._datagen_profiler is not None:

@@ -160,31 +160,44 @@ class MjFilamentRenderer(MjAbstractRenderer):
                     self._service_slot = _rsc.claim_any_slot()
                 else:
                     self._service_slot = _rsc.RenderServiceSlot()
-                mjb_dir = os.environ.get(
-                    "MS_RENDER_SERVICE_MJB_DIR", _tf.gettempdir()
-                )
-                # Content-keyed, write-once transport: benchmark tasks share
-                # compiled models heavily (canary 8757: 96/96 resets saved a
-                # byte-identical 528MB mjb; the synchronized rebuild wave was
-                # a 16GB NFS burst -> 300s+ resets -> mass engine quarantine).
-                # Same key => same file => the server can skip reloading too.
-                import hashlib as _hl
+                transport = os.environ.get("MS_RENDER_SERVICE_TRANSPORT", "").lower()
+                if transport == "xmlfile":
+                    if model_bindings is None or not model_bindings.xml_path:
+                        raise RuntimeError(
+                            "MS_RENDER_SERVICE_TRANSPORT=xmlfile requires a runtime XML path"
+                        )
+                    init_path = f"xmlfile:{model_bindings.xml_path}"
+                else:
+                    mjb_dir = os.environ.get(
+                        "MS_RENDER_SERVICE_MJB_DIR", _tf.gettempdir()
+                    )
+                    # Content-keyed, write-once transport: benchmark tasks share
+                    # compiled models heavily (canary 8757: 96/96 resets saved a
+                    # byte-identical 528MB mjb; the synchronized rebuild wave was
+                    # a 16GB NFS burst -> 300s+ resets -> mass engine quarantine).
+                    # Same key => same file => the server can skip reloading too.
+                    import hashlib as _hl
 
-                _h = _hl.blake2b(digest_size=8)
-                _h.update(np.int64(mj.mj_sizeModel(model)).tobytes())
-                for _arr in (
-                    model.qpos0, model.body_pos, model.geom_pos,
-                    model.geom_size, model.tex_adr, model.mesh_vertadr,
-                ):
-                    _h.update(np.ascontiguousarray(_arr).tobytes())
-                mjb_path = os.path.join(
-                    mjb_dir, f"rsvc_sig_{_h.hexdigest()}.mjb"
-                )
-                if not os.path.exists(mjb_path):
-                    _tmp = f"{mjb_path}.tmp.{os.getpid()}"
-                    mj.mj_saveModel(model, _tmp, None)
-                    os.replace(_tmp, mjb_path)
-                self._service_slot.init_model(mjb_path)
+                    _h = _hl.blake2b(digest_size=8)
+                    _h.update(np.int64(mj.mj_sizeModel(model)).tobytes())
+                    for _arr in (
+                        model.qpos0, model.body_pos, model.geom_pos,
+                        model.geom_size, model.tex_adr, model.mesh_vertadr,
+                    ):
+                        _h.update(np.ascontiguousarray(_arr).tobytes())
+                    mjb_path = os.path.join(
+                        mjb_dir, f"rsvc_sig_{_h.hexdigest()}.mjb"
+                    )
+                    if not os.path.exists(mjb_path):
+                        _tmp = f"{mjb_path}.tmp.{os.getpid()}"
+                        mj.mj_saveModel(model, _tmp, None)
+                        os.replace(_tmp, mjb_path)
+                    init_path = (
+                        f"mjbfile:{mjb_path}"
+                        if transport == "mjbfile"
+                        else mjb_path
+                    )
+                self._service_slot.init_model(init_path)
             except Exception:
                 log.exception("render service init failed; using local renderer")
                 self._service_slot = None
