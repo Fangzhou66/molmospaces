@@ -100,6 +100,34 @@ def _versioned_cache_path(rel: Path) -> Path | None:
     return DATA_CACHE_DIR / data_type / source / version / Path(*parts[3:])
 
 
+def _robot_cache_candidates(rel: Path) -> list[Path]:
+    name = rel.name
+    if not name:
+        return []
+
+    robot_versions = DATA_TYPE_TO_SOURCE_TO_VERSION.get("robots", {})
+    preferred = ("franka_droid", "franka_cap", "franka_fr3", "floating_robotiq")
+    sources = [source for source in preferred if source in robot_versions]
+    sources.extend(source for source in robot_versions if source not in sources)
+
+    candidates: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for source in sources:
+        root = DATA_CACHE_DIR / "robots" / source / robot_versions[source]
+        for subdir in (
+            "assets",
+            "robotiq_2f85_v4/assets",
+            "meshes",
+            "robotiq_2f85_v4/meshes",
+        ):
+            add(root / subdir / name)
+    return candidates
+
+
 def _resolve_render_service_xml_path(path: Path, scene_dir: Path) -> str:
     candidates: list[Path] = []
 
@@ -115,6 +143,8 @@ def _resolve_render_service_xml_path(path: Path, scene_dir: Path) -> str:
         add(DATA_CACHE_DIR / rel)
         add(ASSETS_DIR / rel)
         add(_versioned_cache_path(rel))
+        for robot_candidate in _robot_cache_candidates(rel):
+            add(robot_candidate)
 
     for candidate in candidates:
         if candidate.exists():
