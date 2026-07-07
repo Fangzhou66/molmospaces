@@ -34,6 +34,8 @@ from molmo_spaces.env.env import BaseMujocoEnv, CPUMujocoEnv
 # Dataset helpers for house index mapping
 from molmo_spaces.molmo_spaces_constants import (
     ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR,
+    ASSETS_DIR,
+    DATA_CACHE_DIR,
     DATA_TYPE_TO_SOURCE_TO_VERSION,
     get_scenes,
     get_scenes_root,
@@ -62,6 +64,49 @@ def _normalize_render_service_xml(root: ET.Element) -> None:
             elem.set("gridlayout", layout[:expected])
 
 
+def _cache_relative_path(path: Path) -> Path | None:
+    parts = path.parts
+    for i in range(len(parts) - 1):
+        if parts[i] == ".cache" and parts[i + 1] == "molmo-spaces-resources":
+            rel_parts = parts[i + 2 :]
+            return Path(*rel_parts) if rel_parts else Path()
+    return None
+
+
+def _versioned_cache_path(rel: Path) -> Path | None:
+    parts = rel.parts
+    if len(parts) < 3 or parts[0] != "scenes":
+        return None
+    data_type = parts[1]
+    source = parts[2]
+    version = DATA_TYPE_TO_SOURCE_TO_VERSION.get(data_type, {}).get(source)
+    if not version:
+        return None
+    return DATA_CACHE_DIR / data_type / source / version / Path(*parts[3:])
+
+
+def _resolve_render_service_xml_path(path: Path, scene_dir: Path) -> str:
+    candidates: list[Path] = []
+
+    def add(candidate: Path | None) -> None:
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(path if path.is_absolute() else scene_dir / path)
+    for candidate in list(candidates):
+        rel = _cache_relative_path(candidate)
+        if rel is None:
+            continue
+        add(DATA_CACHE_DIR / rel)
+        add(ASSETS_DIR / rel)
+        add(_versioned_cache_path(rel))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return str(candidates[0])
+
+
 def _stage_render_service_xml(spec: MjSpec, scene_file_path) -> str:
     scene_dir = Path(scene_file_path).resolve().parent
     xml_text = spec.to_xml()
@@ -70,16 +115,18 @@ def _stage_render_service_xml(spec: MjSpec, scene_file_path) -> str:
 
     for elem in root.iter():
         if "file" in elem.attrib:
-            path = Path(elem.attrib["file"])
-            if not path.is_absolute():
-                elem.set("file", str((scene_dir / path).resolve()))
+            elem.set(
+                "file",
+                _resolve_render_service_xml_path(Path(elem.attrib["file"]), scene_dir),
+            )
         if elem.tag == "compiler":
             for attr in ("assetdir", "meshdir", "texturedir"):
                 value = elem.attrib.get(attr)
                 if value:
-                    path = Path(value)
-                    if not path.is_absolute():
-                        elem.set(attr, str((scene_dir / path).resolve()))
+                    elem.set(
+                        attr,
+                        _resolve_render_service_xml_path(Path(value), scene_dir),
+                    )
 
     staged = ET.tostring(root, encoding="utf-8")
     digest = hashlib.blake2b(staged, digest_size=12).hexdigest()
