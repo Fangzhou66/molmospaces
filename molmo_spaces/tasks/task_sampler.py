@@ -47,10 +47,26 @@ def _render_service_xml_enabled() -> bool:
     return os.environ.get("MS_RENDER_SERVICE_TRANSPORT", "").lower() == "xmlfile"
 
 
+def _normalize_render_service_xml(root: ET.Element) -> None:
+    for elem in root.iter("texture"):
+        grid = elem.attrib.get("gridsize")
+        layout = elem.attrib.get("gridlayout")
+        if not grid or layout is None:
+            continue
+        try:
+            dims = [int(x) for x in grid.split()]
+        except ValueError:
+            continue
+        expected = math.prod(dims)
+        if expected > 0 and len(layout) > expected:
+            elem.set("gridlayout", layout[:expected])
+
+
 def _stage_render_service_xml(spec: MjSpec, scene_file_path) -> str:
     scene_dir = Path(scene_file_path).resolve().parent
     xml_text = spec.to_xml()
     root = ET.fromstring(xml_text)
+    _normalize_render_service_xml(root)
 
     for elem in root.iter():
         if "file" in elem.attrib:
