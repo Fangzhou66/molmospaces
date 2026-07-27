@@ -61,6 +61,19 @@ jobs:
           source .venv/bin/activate
           python -m pytest mlspaces_tests/component_tests/ -v --tb=short
 
+      # Eval-integrity suites: the h5 write path, the scorer's denominator, and the
+      # asset-blacklist pin. All filesystem-only (no MuJoCo, no GPU), so they belong
+      # in CI -- without this step none of them ever run automatically.
+      - name: Run eval-integrity tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            mlspaces_tests/utils/ \
+            mlspaces_tests/benchmarks/ \
+            mlspaces_tests/data_generation/test_asset_blacklist.py \
+            mlspaces_tests/data_generation/test_json_eval_task_sampler.py \
+            -v --tb=short
+
   ruff-checks:
     runs-on: ubuntu-latest
     steps:

@@ -6,6 +6,7 @@ Filesystem-only: no MuJoCo, no GPU.
 import importlib.util
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import h5py
@@ -213,10 +214,12 @@ def test_no_temp_files_leak_on_refusal(run_dir, tmp_path):
     _write_manifest(run_dir, 10)
     for i in range(7):
         _write_episode(run_dir, i)
-    before = set(os.listdir("/tmp"))
+    # tempfile honours $TMPDIR; hardcoding /tmp silently disarms this guard.
+    tmp_root = tempfile.gettempdir()
+    before = set(os.listdir(tmp_root))
 
     with pytest.raises(IncompleteEvalError):
         eval_to_csv(str(run_dir), "col9", output_csv=str(tmp_path / "results.csv"))
 
-    leaked = [n for n in set(os.listdir("/tmp")) - before if n.endswith(".h5")]
+    leaked = [n for n in set(os.listdir(tmp_root)) - before if n.endswith(".h5")]
     assert leaked == []

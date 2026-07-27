@@ -243,6 +243,15 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             exp_config: Base experiment config (provides robot_config, etc.)
             episode_spec: The episode specification from JSON benchmark
         """
+        # Seal + pin the asset blacklist before anything else in this constructor:
+        # it must be frozen before any scene is compiled, so setup_robot_scene's
+        # mass/inertia handler cannot append to the in-repo file mid-run from inside
+        # a scored eval. Placed at the very top rather than next to super().__init__
+        # because upstream inserts its own block at that anchor, and a merge conflict
+        # over these two lines is a conflict over whether the seal exists at all.
+        seal_asset_blacklist()
+        assert_asset_blacklist_pinned()
+
         # Validate required fields upfront - fail fast on missing data
         self._validate_episode_spec(episode_spec)
 
@@ -283,12 +292,6 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         # TODO(RMH): Add input arg for noise level (high, low, medium) to support noisy eval
         if exp_config.robot_config.action_noise_config is not None:
             exp_config.robot_config.action_noise_config.enabled = False
-
-        # Seal + pin BEFORE any scene is compiled, so (i) this process reads one
-        # fixed UID set and (ii) setup_robot_scene's mass/inertia handler can no
-        # longer append to the in-repo file mid-run from inside a scored eval.
-        self._sealed_asset_blacklist = seal_asset_blacklist()
-        assert_asset_blacklist_pinned()
 
         super().__init__(exp_config)
 

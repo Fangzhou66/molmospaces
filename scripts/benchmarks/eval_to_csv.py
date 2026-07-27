@@ -263,7 +263,86 @@ def _build_row(policy_name, category, s, t, jerk_list, report_both, oracle_s=0):
     return row, rate
 
 
-def _enforce_completeness(report, run_path, combined_h5, *, allow_incomplete):
+@dataclass(frozen=True)
+class ScoringOptions:
+    """How each episode's success array is reduced to a single verdict."""
+
+    success_condition: str = "at-end"
+    dt: float = 0.1
+    max_steps: int | None = None
+    allow_incomplete: bool = False
+
+    @property
+    def report_both(self) -> bool:
+        return self.success_condition == "both"
+
+
+@dataclass
+class Tally:
+    per_obj: dict = field(default_factory=dict)
+    total_s: int = 0
+    total_os: int = 0
+    total_n: int = 0
+    all_jerk_joint: list = field(default_factory=list)
+
+
+def _episode_verdict(s_arr, opts):
+    """(success, oracle_success) for one episode under the configured condition."""
+    if opts.report_both:
+        return get_success_last_frame(s_arr), get_success_any(s_arr)
+    if opts.success_condition == "at-end":
+        return get_success_last_frame(s_arr), None
+    if opts.success_condition == "oracle":
+        return get_success_any(s_arr), None
+    raise ValueError(f"Unknown success condition: {opts.success_condition}")
+
+
+def _score_combined(combined_h5, opts) -> Tally:
+    """Aggregate per-object and overall counts from the merged h5."""
+    per_obj = defaultdict(lambda: {"success": 0, "oracle_success": 0, "total": 0, "jerk_joint": []})
+    tally = Tally(per_obj=per_obj)
+
+    with h5py.File(combined_h5, "r") as f:
+        for key in sorted(f.keys()):
+            if not key.startswith("episode_"):
+                continue
+            ep = f[key]
+
+            if "success" not in ep:
+                # This module configures no logging handler, so the log.info that
+                # used to sit here produced no output at all -- the episode left the
+                # denominator with no trace anywhere.
+                if not opts.allow_incomplete:
+                    raise IncompleteEvalError(
+                        f"episode {key} has no `success` array; refusing to drop it "
+                        f"silently from the denominator (pass --allow-incomplete)"
+                    )
+                print(f"Warning: no success array for {key}, skipping", file=sys.stderr)
+                continue
+
+            s_arr = ep["success"][:opts.max_steps] if opts.max_steps is not None else ep["success"][:]
+            success, oracle_success = _episode_verdict(s_arr, opts)
+
+            jj = _episode_joint_jerk(ep, opts.dt, max_steps=opts.max_steps)
+            obj = _simplify(_extract_object_name(ep["obs_scene"][()])) if "obs_scene" in ep else "Unknown"
+
+            per_obj[obj]["total"] += 1
+            per_obj[obj]["success"] += int(success)
+            if oracle_success is not None:
+                per_obj[obj]["oracle_success"] += int(oracle_success)
+            if not np.isnan(jj):
+                per_obj[obj]["jerk_joint"].append(jj)
+                tally.all_jerk_joint.append(jj)
+
+            tally.total_n += 1
+            tally.total_s += int(success)
+            if oracle_success is not None:
+                tally.total_os += int(oracle_success)
+
+    return tally
+
+
+def _enforce_completeness(report, run_path, *, allow_incomplete):
     """Refuse to emit a rate over a biased subset, or say loudly that it is one."""
     if report.expected is None:
         print(
@@ -280,7 +359,6 @@ def _enforce_completeness(report, run_path, combined_h5, *, allow_incomplete):
 
     message = report.describe(run_path)
     if not allow_incomplete:
-        os.unlink(combined_h5)
         raise IncompleteEvalError(
             message + "\nRefusing to emit a success rate over a biased subset. "
             "Pass --allow-incomplete to override."
@@ -304,107 +382,65 @@ def eval_to_csv(
     combined_h5, report.unreadable = _combine_trajectories(
         run_path, allow_incomplete=allow_incomplete
     )
-    _enforce_completeness(report, run_path, combined_h5, allow_incomplete=allow_incomplete)
-    per_obj = defaultdict(lambda: {"success": 0, "oracle_success": 0, "total": 0, "jerk_joint": []})
-    total_s, total_os, total_n = 0, 0, 0
-    all_jerk_joint = []
+    # try/finally, not bare unlinks: every refusal path below raises, and so can
+    # _episode_joint_jerk on a corrupt qpos row. The temp file must go regardless.
+    try:
+        _enforce_completeness(report, run_path, allow_incomplete=allow_incomplete)
+        opts = ScoringOptions(
+            success_condition=success_condition,
+            dt=dt,
+            max_steps=max_steps,
+            allow_incomplete=allow_incomplete,
+        )
+        tally = _score_combined(combined_h5, opts)
 
-    with h5py.File(combined_h5, "r") as f:
-        for key in sorted(f.keys()):
-            if not key.startswith("episode_"):
-                continue
-            ep = f[key]
+        rows = []
+        for obj in sorted(tally.per_obj):
+            d = tally.per_obj[obj]
+            row, _ = _build_row(policy_name, obj, d["success"], d["total"],
+                                d["jerk_joint"], report_both, d["oracle_success"])
+            rows.append(row)
 
-            if "success" in ep:
-                s_arr = ep["success"][:max_steps] if max_steps is not None else ep["success"][:]
-                if report_both:
-                    success = get_success_last_frame(s_arr)
-                    oracle_success = get_success_any(s_arr)
-                elif success_condition == "at-end":
-                    success = get_success_last_frame(s_arr)
-                    oracle_success = None
-                elif success_condition == "oracle":
-                    success = get_success_any(s_arr)
-                    oracle_success = None
-                else:
-                    raise ValueError(f"Unknown success condition: {success_condition}")
-            else:
-                # This module configures no logging handler, so the log.info that
-                # used to sit here produced no output at all -- the episode left the
-                # denominator with no trace anywhere.
-                if not allow_incomplete:
-                    os.unlink(combined_h5)
-                    raise IncompleteEvalError(
-                        f"episode {key} has no `success` array; refusing to drop it "
-                        f"silently from the denominator (pass --allow-incomplete)"
-                    )
-                print(f"Warning: no success array for {key}, skipping", file=sys.stderr)
-                continue
+        if tally.total_n == 0 and not allow_incomplete:
+            raise IncompleteEvalError(f"scored 0 episodes under {run_path}")
 
-            jj = _episode_joint_jerk(ep, dt, max_steps=max_steps)
-            obj = _simplify(_extract_object_name(ep["obs_scene"][()])) if "obs_scene" in ep else "Unknown"
+        overall_row, rate = _build_row(policy_name, "OVERALL", tally.total_s, tally.total_n,
+                                       tally.all_jerk_joint, report_both, tally.total_os)
+        rows.append(overall_row)
 
-            per_obj[obj]["total"] += 1
-            per_obj[obj]["success"] += int(success)
-            if oracle_success is not None:
-                per_obj[obj]["oracle_success"] += int(oracle_success)
-            if not np.isnan(jj):
-                per_obj[obj]["jerk_joint"].append(jj)
-                all_jerk_joint.append(jj)
+        output_csv = Path(output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-            total_n += 1
-            total_s += int(success)
-            if oracle_success is not None:
-                total_os += int(oracle_success)
+        # The `complete` COLUMN, not only the `#` provenance lines, is the load-bearing
+        # half: any concat of these CSVs into a board sheet drops comment lines.
+        for row in rows:
+            row["complete"] = report.complete
 
-    rows = []
-    for obj in sorted(per_obj):
-        d = per_obj[obj]
-        row, _ = _build_row(policy_name, obj, d["success"], d["total"],
-                            d["jerk_joint"], report_both, d["oracle_success"])
-        rows.append(row)
+        df = pd.DataFrame(rows)
+        with open(output_csv, "w") as fout:
+            fout.write(f"# policy_name: {policy_name}\n")
+            fout.write(f"# run_path: {run_path}\n")
+            fout.write(f"# dt: {dt}\n")
+            fout.write(f"# max_steps: {max_steps}\n")
+            fout.write(f"# expected_episodes: {report.expected}\n")
+            fout.write(f"# scored_episodes: {tally.total_n}\n")
+            if report.complete is not True:
+                fout.write(
+                    f"# INCOMPLETE: {len(report.missing)} missing {report.missing[:20]} "
+                    f"failed_markers={len(report.failed)} partial_dirs={len(report.partial)} "
+                    f"unreadable={len(report.unreadable)}\n"
+                )
+            df.to_csv(fout, index=False)
 
-    if total_n == 0 and not allow_incomplete:
+        summary = f"SR: {round(rate, 2)}%"
+        if report_both:
+            o_rate = 100.0 * tally.total_os / tally.total_n if tally.total_n else 0.0
+            summary = f"at-end: {round(rate, 2)}% | oracle: {round(o_rate, 2)}%"
+        print(f"\nSaved → {os.path.abspath(output_csv)} {summary} of {tally.total_n} episodes")
+
+        return df
+    finally:
         os.unlink(combined_h5)
-        raise IncompleteEvalError(f"scored 0 episodes under {run_path}")
-
-    overall_row, rate = _build_row(policy_name, "OVERALL", total_s, total_n,
-                                   all_jerk_joint, report_both, total_os)
-    rows.append(overall_row)
-
-    output_csv = Path(output_csv)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    # The `complete` COLUMN, not only the `#` provenance lines, is the load-bearing
-    # half: any concat of these CSVs into a board sheet drops comment lines.
-    for row in rows:
-        row["complete"] = report.complete
-
-    df = pd.DataFrame(rows)
-    with open(output_csv, "w") as fout:
-        fout.write(f"# policy_name: {policy_name}\n")
-        fout.write(f"# run_path: {run_path}\n")
-        fout.write(f"# dt: {dt}\n")
-        fout.write(f"# max_steps: {max_steps}\n")
-        fout.write(f"# expected_episodes: {report.expected}\n")
-        fout.write(f"# scored_episodes: {total_n}\n")
-        if report.complete is not True:
-            fout.write(
-                f"# INCOMPLETE: {len(report.missing)} missing {report.missing[:20]} "
-                f"failed_markers={len(report.failed)} partial_dirs={len(report.partial)} "
-                f"unreadable={len(report.unreadable)}\n"
-            )
-        df.to_csv(fout, index=False)
-
-    summary = f"SR: {round(rate, 2)}%"
-    if report_both:
-        o_rate = 100.0 * total_os / total_n if total_n else 0.0
-        summary = f"at-end: {round(rate, 2)}% | oracle: {round(o_rate, 2)}%"
-    print(f"\nSaved → {os.path.abspath(output_csv)} {summary} of {total_n} episodes")
-
-    os.unlink(combined_h5)
-
-    return df
 
 
 if __name__ == "__main__":

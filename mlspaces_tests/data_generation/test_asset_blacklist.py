@@ -27,6 +27,16 @@ def fresh(monkeypatch):
     modules that imported the original class then fail their subclass checks --
     which silently breaks unrelated tests later in the session.
     """
+    # get_asset_blacklist_path() re-reads os.environ on every call, so an ambient
+    # var makes these tests assert on whatever it points at. The dangerous direction
+    # is green-without-reading: a read path aimed at any 4-UID copy makes the pin
+    # test pass while never touching the repo file it exists to guard.
+    for var in (
+        "MLSPACES_ASSET_BLACKLIST_PATH",
+        "MLSPACES_ASSET_BLACKLIST_WRITE_PATH",
+        "MLSPACES_EVAL_BLACKLIST_PIN",
+    ):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ts, "_STATIC_ASSET_BLACKLIST", None)
     monkeypatch.setattr(ts, "_BLACKLIST_SEALED", False)
     return ts
