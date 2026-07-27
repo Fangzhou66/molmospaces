@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 
 _MAXSTATE = 200000
 _CAM_OFF, _STATE_OFF = 1040, 1200
+# Protocol v1.3 capability marker. The server writes it into cam[18] when a
+# slot reaches ready; the client only READS it (it packs cam[0..17] only), so
+# the marker survives every render. Its absence means a pre-v1.3 server that
+# would silently render a default free camera -- the 2026-07-25 defect -- so
+# the client raises instead of falling back.
+_GLCAM_CAP = 20260725.0
+_CAP_OFF = _CAM_OFF + 18 * 8
 _PIX_OFF = _STATE_OFF + _MAXSTATE * 8
 _MAX_W, _MAX_H = 624, 352
 SLOT_BYTES = _PIX_OFF + _MAX_W * _MAX_H * 3
@@ -95,6 +102,8 @@ class RenderServiceSlot:
         self._f = open(path, "r+b")
         self._m = mmap.mmap(self._f.fileno(), SLOT_BYTES)
         self.nstate: int | None = None
+        # Set from the server's cam[18] marker in init_model(); False until then.
+        self.glcam_capable: bool = False
         self._claim_fd: int | None = None
 
     def release(self) -> None:
@@ -145,17 +154,26 @@ class RenderServiceSlot:
                 raise TimeoutError(f"render service slot {self.slot}: flag={f}")
             time.sleep(0.0002)
         self.nstate = struct.unpack_from("<i", self._m, 4)[0]
-        log.info("render service slot %d ready (nstate=%d)", self.slot, self.nstate)
+        self.glcam_capable = (
+            struct.unpack_from("<d", self._m, _CAP_OFF)[0] == _GLCAM_CAP
+        )
+        log.info(
+            "render service slot %d ready (nstate=%d glcam=%s)",
+            self.slot, self.nstate, self.glcam_capable,
+        )
         return self.nstate
 
     def render_rgb(self, state: np.ndarray, cam10, width: int, height: int,
                    derived_blob: bytes | None = None, segmentation: bool = False,
-                   timeout_s: float = 60.0) -> np.ndarray:
+                   timeout_s: float = 60.0, cam_tail=None) -> np.ndarray:
         if width * height * 3 > _MAX_W * _MAX_H * 3:
             raise ValueError(f"resolution {width}x{height} exceeds protocol buffer")
-        cam12 = tuple(cam10) + (1.0 if derived_blob else 0.0,
-                                1.0 if segmentation else 0.0)
-        struct.pack_into("<12d", self._m, _CAM_OFF, *cam12)
+        # cam[0..17]; cam[18..19] belong to the server (capability marker).
+        cam18 = (tuple(cam10)
+                 + (1.0 if derived_blob else 0.0, 1.0 if segmentation else 0.0)
+                 + tuple(cam_tail if cam_tail is not None else (0.0,) * 4)
+                 + (0.0, 0.0))
+        struct.pack_into("<18d", self._m, _CAM_OFF, *cam18)
         sb = state.tobytes()
         self._m[_STATE_OFF:_STATE_OFF + len(sb)] = sb
         if derived_blob:
@@ -169,8 +187,40 @@ class RenderServiceSlot:
         return np.frombuffer(self._m[_PIX_OFF:_PIX_OFF + n], dtype=np.uint8).reshape(height, width, 3)
 
 
+def glcam_to_cam10(gl_camera, fovy: float, width: int, height: int) -> tuple:
+    """Translate a resolved ``MjvGLCamera`` into protocol v1.3 mode 3.
+
+    THE POINT OF THIS FUNCTION (2026-07-25). ``MolmoSpacesEnv._render_frame``
+    builds a throwaway ``MjvCamera``, passes it to ``update()`` purely to
+    satisfy the signature, and then writes the REAL pose onto
+    ``scene.camera[*]`` -- which are ``MjvGLCamera`` objects carrying
+    ``pos/forward/up``. ``MjvCamera`` has no such fields, so the legacy
+    ``camera_to_cam10`` path serialized an untouched placeholder and every
+    service render used a constant world-origin camera
+    (lookat=(0,0,0), distance=2, azimuth=90, elevation=-45).
+
+    Mode 3 therefore transports the resolved GL camera itself. Returns the
+    cam[0..9] head; pair it with :func:`glcam_tail` for cam[12..15].
+    """
+    return (float(gl_camera.pos[0]), float(gl_camera.pos[1]), float(gl_camera.pos[2]),
+            float(gl_camera.forward[0]), float(gl_camera.forward[1]),
+            float(gl_camera.forward[2]),
+            3.0, -1.0, float(width), float(height))
+
+
+def glcam_tail(gl_camera, fovy: float) -> tuple:
+    """cam[12..15] for mode 3: up3 + fovy."""
+    return (float(gl_camera.up[0]), float(gl_camera.up[1]), float(gl_camera.up[2]),
+            float(fovy))
+
+
 def camera_to_cam10(camera, width: int, height: int) -> tuple:
-    """Translate an mjvCamera into the protocol's 10-double struct."""
+    """Translate an mjvCamera into the protocol's 10-double struct.
+
+    LEGACY (mode 0/2). Correct only when the caller genuinely carries the pose
+    in the ``MjvCamera`` -- which ``_render_frame`` does not. Kept for the
+    fixed-camera path and for ``MS_RENDER_SERVICE_GLCAM=0`` A/B arms.
+    """
     import mujoco as mj
 
     if camera.type == mj.mjtCamera.mjCAMERA_FIXED:

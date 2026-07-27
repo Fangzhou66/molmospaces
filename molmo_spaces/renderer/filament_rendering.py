@@ -199,8 +199,41 @@ class MjFilamentRenderer(MjAbstractRenderer):
                     )
                 self._service_slot.init_model(init_path)
             except Exception:
-                log.exception("render service init failed; using local renderer")
-                self._service_slot = None
+                # FAIL LOUD by default (2026-07-26). Silently degrading to the
+                # local renderer means a "service arm" can be a local arm, and
+                # nobody can tell from the numbers -- exactly the shape of the
+                # T4 gate defect, where a C++-only harness let a constant
+                # world-origin camera pass for weeks. Any A/B, canary or
+                # acceptance gate built on top of a silent fallback measures
+                # the wrong thing.
+                # MS_RENDER_SERVICE_ALLOW_FALLBACK=1 restores the old
+                # degrade-and-continue behaviour for ad-hoc runs.
+                if os.environ.get("MS_RENDER_SERVICE_ALLOW_FALLBACK") == "1":
+                    log.exception(
+                        "render service init failed; using local renderer "
+                        "(MS_RENDER_SERVICE_ALLOW_FALLBACK=1)"
+                    )
+                    self._service_slot = None
+                else:
+                    raise
+
+        # Protocol v1.3 gate. Deliberately OUTSIDE the try above: a stale
+        # server has no cam[18] marker and would serialize an untouched
+        # placeholder MjvCamera, rendering every frame from a constant
+        # world-origin camera. That is the 2026-07-25 defect, and it is
+        # invisible in throughput metrics -- so fail the process rather than
+        # let another ladder be measured on the wrong pixels.
+        if (
+            self._service_slot is not None
+            and not self._service_slot.glcam_capable
+            and os.environ.get("MS_RENDER_SERVICE_GLCAM", "1") == "1"
+        ):
+            raise RuntimeError(
+                "render_service_v2 predates protocol v1.3 (no cam[18] capability "
+                "marker): it would render a constant world-origin camera. Rebuild "
+                "the service, or set MS_RENDER_SERVICE_GLCAM=0 to deliberately "
+                "reproduce the legacy (wrong-camera) arm."
+            )
 
         # Turn off site rendering
         self._scene_option.sitegroup *= 0
@@ -284,6 +317,30 @@ class MjFilamentRenderer(MjAbstractRenderer):
     def geomid_to_bodyid(self, geomid):
         return self.model.geom_bodyid[geomid]
 
+    def _service_cam(self, width: int, height: int):
+        """Build the render-service camera payload -> ``(cam10, cam_tail)``.
+
+        ``_render_frame`` writes the real pose onto ``scene.camera[*]``
+        (``MjvGLCamera``: pos/forward/up) AFTER ``update()`` returns; the
+        ``MjvCamera`` it hands to ``update()`` is a bare placeholder that has
+        no such fields. So the resolved scene camera -- not
+        ``_service_last_camera`` -- is the only object that carries the truth.
+        """
+        from molmo_spaces.renderer import render_service_client as _rsc
+
+        if os.environ.get("MS_RENDER_SERVICE_GLCAM", "1") != "1":
+            # Legacy arm, kept solely so the wrong-camera baseline is
+            # reproducible for A/B.
+            return _rsc.camera_to_cam10(
+                self._service_last_camera, width, height
+            ), None
+        gl = self._scene.camera[0]
+        fovy = float(self._model.vis.global_.fovy)
+        return (
+            _rsc.glcam_to_cam10(gl, fovy, width, height),
+            _rsc.glcam_tail(gl, fovy),
+        )
+
     def render(
         self,
         *,
@@ -309,20 +366,32 @@ class MjFilamentRenderer(MjAbstractRenderer):
                     self._model, self._service_last_data, state,
                     mj.mjtState.mjSTATE_INTEGRATION,
                 )
-                cam10 = _rsc.camera_to_cam10(
-                    self._service_last_camera, width, height
-                )
+                cam10, cam_tail = self._service_cam(width, height)
                 blob = _rsc.derived_blob_from_data(
                     self._model, self._service_last_data
                 )
                 px = self._service_slot.render_rgb(
-                    state, cam10, width, height, derived_blob=blob
+                    state, cam10, width, height, derived_blob=blob,
+                    cam_tail=cam_tail,
                 )
                 if out is None:
                     return px.copy()
                 out[...] = px
                 return out
             except Exception:
+                # The "fallback" below is not a fallback: under the service
+                # self._mjr_context is None (set at __init__), so the local
+                # path reaches mjr_readPixels(con=None) and raises TypeError,
+                # killing the engine anyway -- reproduced in job 10608, where a
+                # service-side geom error became a 60s TimeoutError and then a
+                # TypeError. So the choice is between dying with a misleading
+                # traceback and dying with the real one. Default to the real
+                # one; MS_RENDER_SERVICE_ALLOW_FALLBACK=1 keeps the old path
+                # for callers that genuinely hold a local context.
+                if (os.environ.get("MS_RENDER_SERVICE_ALLOW_FALLBACK") != "1"
+                        or self._mjr_context is None):
+                    log.exception("render service call failed")
+                    raise
                 log.exception("render service call failed; falling back local")
 
         rect = mj.MjrRect(0, 0, width, height)
@@ -421,10 +490,11 @@ class MjFilamentRenderer(MjAbstractRenderer):
                     self._model, self._service_last_data, state,
                     mj.mjtState.mjSTATE_INTEGRATION,
                 )
-                cam10 = _rsc.camera_to_cam10(self._service_last_camera, width, height)
+                cam10, cam_tail = self._service_cam(width, height)
                 blob = _rsc.derived_blob_from_data(self._model, self._service_last_data)
                 out[...] = self._service_slot.render_rgb(
-                    state, cam10, width, height, derived_blob=blob, segmentation=True
+                    state, cam10, width, height, derived_blob=blob,
+                    segmentation=True, cam_tail=cam_tail,
                 )
 
             # Convert 3-channel uint8 to 1-channel uint32.
