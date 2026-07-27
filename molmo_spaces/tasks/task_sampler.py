@@ -12,9 +12,11 @@ import hashlib
 import math
 import os
 import random
+import re
 import time
 from abc import abstractmethod
 from collections import Counter, defaultdict
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,7 @@ from molmo_spaces.molmo_spaces_constants import (
 
 MJC_VERSION = tuple(map(int, mujoco.__version__.split(".")))
 FILAMENT_ATTR_ENV_LIGHT_INTENSITY = "filament.fallback.environment_light_intensity"
+_OBJAVERSE_ASSET_RE = re.compile(r"^([0-9a-fA-F]{32})(?=[_.]|$)")
 
 
 def _render_service_xml_enabled() -> bool:
@@ -128,6 +131,82 @@ def _robot_cache_candidates(rel: Path) -> list[Path]:
     return candidates
 
 
+def _object_cache_candidates(path: Path) -> list[Path]:
+    versions = DATA_TYPE_TO_SOURCE_TO_VERSION.get("objects", {})
+    candidates: list[Path] = []
+
+    def add(candidate: Path | None) -> None:
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    def add_source_tail(source: str, tail: Path) -> None:
+        version = versions.get(source)
+        if not version or not tail.parts:
+            return
+        versioned_tail = tail
+        if tail.parts[0] != version:
+            versioned_tail = Path(version) / tail
+        add(DATA_CACHE_DIR / "objects" / source / versioned_tail)
+        add(ASSETS_DIR / "objects" / source / versioned_tail)
+
+    rel_paths = [path]
+    cache_rel = _cache_relative_path(path)
+    if cache_rel is not None:
+        rel_paths.append(cache_rel)
+
+    for rel in rel_paths:
+        parts = rel.parts
+        for i in range(len(parts) - 2):
+            if parts[i] == "objects" and parts[i + 1] in versions:
+                add_source_tail(parts[i + 1], Path(*parts[i + 2 :]))
+
+    objaverse_version = versions.get("objaverse")
+    match = _OBJAVERSE_ASSET_RE.match(path.name)
+    if objaverse_version and match:
+        uid = match.group(1)
+        for root in (DATA_CACHE_DIR, ASSETS_DIR):
+            add(root / "objects" / "objaverse" / objaverse_version / uid / path.name)
+
+    return candidates
+
+
+@cache
+def _thor_cache_suffix_candidates(suffix: str) -> tuple[Path, ...]:
+    version = DATA_TYPE_TO_SOURCE_TO_VERSION.get("objects", {}).get("thor")
+    if not version:
+        return ()
+
+    suffix_path = _collapse_path_parts(Path(suffix))
+    suffix_parts = suffix_path.parts
+    if not suffix_parts:
+        return ()
+
+    matches: list[Path] = []
+    for root in (
+        DATA_CACHE_DIR / "objects" / "thor" / version,
+        ASSETS_DIR / "objects" / "thor" / version,
+    ):
+        if not root.is_dir():
+            continue
+        for candidate in root.rglob(suffix_parts[-1]):
+            if candidate.parts[-len(suffix_parts) :] == suffix_parts and candidate not in matches:
+                matches.append(candidate)
+    return tuple(matches)
+
+
+def _object_cache_suffix_candidates(path: Path) -> list[Path]:
+    suffixes = [path.name]
+    if path.parent != Path(".") and path.parent.name:
+        suffixes.insert(0, str(Path(path.parent.name) / path.name))
+
+    candidates: list[Path] = []
+    for suffix in suffixes:
+        for candidate in _thor_cache_suffix_candidates(suffix):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
 def _resolve_render_service_xml_path(path: Path, scene_dir: Path) -> str:
     candidates: list[Path] = []
 
@@ -145,8 +224,13 @@ def _resolve_render_service_xml_path(path: Path, scene_dir: Path) -> str:
         add(_versioned_cache_path(rel))
         for robot_candidate in _robot_cache_candidates(rel):
             add(robot_candidate)
+    for object_candidate in _object_cache_candidates(path):
+        add(object_candidate)
 
     for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    for candidate in _object_cache_suffix_candidates(path):
         if candidate.exists():
             return str(candidate.resolve())
     return str(candidates[0])

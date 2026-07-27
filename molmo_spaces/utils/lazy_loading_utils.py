@@ -35,6 +35,13 @@ class UserGraspLibraryIndex(BaseModel):
     grasp_paths: dict[str, dict[str, Path]] = Field(default_factory=dict)
 
 
+def _relative_to(path: Path, root: Path) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return path.resolve().relative_to(root.resolve())
+
+
 def install_scene_from_source_index(source, idx):
     archives = get_resource_manager().index_lookup("scenes", source, str(idx))
     if len(archives) == 0:
@@ -78,11 +85,11 @@ def find_object_paths(xml_path, exclude_thor=True):
                 if not exclude_thor or "/objects/thor/" not in file_path:
                     # Objects are globally linked from the cache
                     full_path = (scene_dir / file_path).resolve()
-                    source = (
-                        full_path.relative_to(get_resource_manager().cache_dir / "objects")
+                    source = _relative_to(
+                        full_path, get_resource_manager().cache_dir / "objects"
                     ).parts[0]
-                    rel_asset = full_path.relative_to(
-                        get_resource_manager().source_dir("objects", source)
+                    rel_asset = _relative_to(
+                        full_path, get_resource_manager().source_dir("objects", source)
                     )
                     yield source, rel_asset
 
