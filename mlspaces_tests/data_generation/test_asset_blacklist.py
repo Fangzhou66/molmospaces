@@ -21,11 +21,15 @@ UPSTREAM_UIDS = [
 
 @pytest.fixture
 def fresh(monkeypatch):
-    """A module whose blacklist state is not shared with the rest of the suite."""
-    mod = importlib.reload(ts)
-    monkeypatch.setattr(mod, "_STATIC_ASSET_BLACKLIST", None, raising=False)
-    monkeypatch.setattr(mod, "_BLACKLIST_SEALED", False, raising=False)
-    return mod
+    """task_sampler with its blacklist state reset, and restored afterwards.
+
+    Deliberately NOT importlib.reload: reloading rebinds BaseMujocoTaskSampler, and
+    modules that imported the original class then fail their subclass checks --
+    which silently breaks unrelated tests later in the session.
+    """
+    monkeypatch.setattr(ts, "_STATIC_ASSET_BLACKLIST", None)
+    monkeypatch.setattr(ts, "_BLACKLIST_SEALED", False)
+    return ts
 
 
 def _write_blacklist(path, uids):
