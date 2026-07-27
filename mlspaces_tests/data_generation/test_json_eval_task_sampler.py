@@ -201,14 +201,21 @@ class TestMissingObjectPoseBodySkipReason:
 
         assert reason is None
 
-    def test_static_blacklisted_body_is_skipped(self):
+    def test_static_blacklisted_body_is_NOT_skipped(self):
+        """A blacklisted-away body means the scene does not match the benchmark.
+
+        Inverted deliberately. Returning None makes the caller re-raise, which is
+        what upstream does -- it has neither this function nor a blacklist branch.
+        Scoring an episode whose scene is missing a body the frozen spec names
+        produces a number for a different environment.
+        """
         reason = missing_object_pose_body_skip_reason(
             body_name="objaceilingpanel_a3d6f7df9ff94ed59f95d5086d5f3fdd_1_0_4",
             selected_place_receptacle_name=None,
             static_asset_blacklist={"a3d6f7df9ff94ed59f95d5086d5f3fdd"},
         )
 
-        assert reason == "static-blacklisted body (a3d6f7df9ff94ed59f95d5086d5f3fdd)"
+        assert reason is None
 
     def test_unrelated_missing_body_is_not_skipped(self):
         reason = missing_object_pose_body_skip_reason(
