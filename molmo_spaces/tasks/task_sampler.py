@@ -348,6 +348,20 @@ def get_asset_blacklist_path() -> Path:
     )
 
 
+def get_asset_blacklist_write_path() -> Path | None:
+    """Where runtime discoveries may be APPENDED, or None.
+
+    Reading and writing are deliberately different paths. The in-repo file is a
+    read-only pin: appending to it makes a git worktree carry run state, and a
+    val-eval read then sits downstream of a train-datagen write.
+    """
+    for var in ("MLSPACES_ASSET_BLACKLIST_WRITE_PATH", "MLSPACES_ASSET_BLACKLIST_PATH"):
+        path = os.environ.get(var)
+        if path:
+            return Path(path)
+    return None
+
+
 # Default max failures before an asset is dynamically blacklisted during a run
 DEFAULT_MAX_ASSET_FAILURES = 10
 
@@ -363,7 +377,6 @@ def load_asset_blacklist() -> set[str]:
             MLSPACES_ASSET_BLACKLIST_PATH but does not exist.
     """
     blacklist_path = get_asset_blacklist_path()
-    blacklist = set()
     if not blacklist_path.exists():
         # If an explicit path was specified via env var, it must exist
         if os.environ.get("MLSPACES_ASSET_BLACKLIST_PATH"):
@@ -371,6 +384,15 @@ def load_asset_blacklist() -> set[str]:
                 f"Asset blacklist path specified via MLSPACES_ASSET_BLACKLIST_PATH "
                 f"does not exist: {blacklist_path}"
             )
+        return set()
+
+    return _read_blacklist_file(blacklist_path)
+
+
+def _read_blacklist_file(blacklist_path: Path) -> set[str]:
+    """Parse a blacklist file into a UID set. Missing file -> empty set."""
+    blacklist: set[str] = set()
+    if not blacklist_path.exists():
         return blacklist
 
     with open(blacklist_path) as f:
@@ -401,6 +423,68 @@ def get_static_asset_blacklist() -> set[str]:
     return _STATIC_ASSET_BLACKLIST
 
 
+# sha256 of the newline-joined SORTED UID set at upstream c2f1b58 (4 UIDs). The SET
+# is digested, not the bytes, so comment or whitespace edits do not trip it. If
+# UPSTREAM changes its own blacklist, this constant is what you update.
+UPSTREAM_ASSET_BLACKLIST_REV = "c2f1b58"
+UPSTREAM_ASSET_BLACKLIST_SHA256 = "dc96f64a9b6537a4356a898160796e7ebc78d866706810a9a1ff2ace603060fd"
+
+_BLACKLIST_SEALED = False
+
+
+def asset_blacklist_digest(blacklist: set[str] | None = None) -> str:
+    """Digest of the UID SET in effect."""
+    uids = get_static_asset_blacklist() if blacklist is None else blacklist
+    return hashlib.sha256("\n".join(sorted(uids)).encode()).hexdigest()
+
+
+def seal_asset_blacklist() -> frozenset[str]:
+    """Freeze the blacklist for this process. Idempotent.
+
+    A scored run reads exactly ONE blacklist and writes none. The blacklist decides
+    which bodies _delete_blacklisted_bodies removes before compile, so a run that
+    appends to it mid-run scores later episodes in a different environment than
+    earlier ones -- and because the FileLock keys on one shared path, an append made
+    by one column changes what another column sees.
+    """
+    global _BLACKLIST_SEALED
+    blacklist = get_static_asset_blacklist()
+    if not _BLACKLIST_SEALED:
+        _BLACKLIST_SEALED = True
+        log.info(
+            "Asset blacklist SEALED for this process: %d entries from %s",
+            len(blacklist),
+            get_asset_blacklist_path(),
+        )
+    return frozenset(blacklist)
+
+
+def assert_asset_blacklist_pinned(expected_sha256: str | None = None) -> None:
+    """Fail loud if the blacklist in effect is not the pinned one."""
+    expected = (
+        expected_sha256
+        or os.environ.get("MLSPACES_EVAL_BLACKLIST_PIN")
+        or UPSTREAM_ASSET_BLACKLIST_SHA256
+    )
+    blacklist = get_static_asset_blacklist()
+    actual = asset_blacklist_digest(blacklist)
+    if actual == expected:
+        return
+    raise RuntimeError(
+        f"Asset blacklist drift: {get_asset_blacklist_path()} holds {len(blacklist)} "
+        f"entries with digest {actual}, expected {expected} (pinned to "
+        f"{UPSTREAM_ASSET_BLACKLIST_REV}). The blacklist decides which bodies are "
+        f"deleted before scene compile, so this run would score a different "
+        f"environment.\n"
+        f"  If runtime datagen appended to the in-repo file: restore it (git checkout "
+        f"{UPSTREAM_ASSET_BLACKLIST_REV} -- "
+        f"molmo_spaces/data_generation/asset_blacklist.txt), or point "
+        f"MLSPACES_ASSET_BLACKLIST_PATH at the pinned copy.\n"
+        f"  If UPSTREAM changed its blacklist: update "
+        f"UPSTREAM_ASSET_BLACKLIST_SHA256 / _REV in this file."
+    )
+
+
 def add_to_static_blacklist(asset_uid: str, reason: str = "") -> bool:
     """Add an asset UID to the static blacklist file with file locking.
 
@@ -424,7 +508,36 @@ def add_to_static_blacklist(asset_uid: str, reason: str = "") -> bool:
     if _STATIC_ASSET_BLACKLIST is not None and asset_uid in _STATIC_ASSET_BLACKLIST:
         return False
 
-    blacklist_path = get_asset_blacklist_path()
+    if _BLACKLIST_SEALED:
+        # Sealed = scored run. Do NOT persist AND do not mutate the in-process set:
+        # the environment a scored run reads must be frozen for its whole duration.
+        # The house that triggered this raises and produces no h5 -- which is loud,
+        # because eval_to_csv reconciles the published set against _MANIFEST.json.
+        log.error(
+            "REFUSING to blacklist %s (%s): sealed for this process. Runtime "
+            "discoveries are run state, not source; a scored run must never rewrite "
+            "the file it scores against. Reason was: %s",
+            asset_uid,
+            get_asset_blacklist_path(),
+            reason or "(none)",
+        )
+        return False
+
+    blacklist_path = get_asset_blacklist_write_path()
+    if blacklist_path is None:
+        # The in-repo file is deliberately NOT a write target. Keep the in-run
+        # self-heal (unsealed callers are datagen) but do not launder run state into
+        # the git worktree that defines the scored environment.
+        if _STATIC_ASSET_BLACKLIST is not None:
+            _STATIC_ASSET_BLACKLIST.add(asset_uid)
+        log.warning(
+            "Discovered bad asset %s (%s) but did NOT persist it: set "
+            "MLSPACES_ASSET_BLACKLIST_WRITE_PATH (or MLSPACES_ASSET_BLACKLIST_PATH) "
+            "to a state file outside the repo.",
+            asset_uid,
+            reason or "(none)",
+        )
+        return False
 
     # Ensure parent directory exists
     blacklist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,8 +547,10 @@ def add_to_static_blacklist(asset_uid: str, reason: str = "") -> bool:
 
     try:
         with lock:
-            # Re-check file contents under lock (another worker may have added it)
-            current_blacklist = load_asset_blacklist()
+            # Re-check under lock (another worker may have added it). Read the WRITE
+            # file, not get_asset_blacklist_path(): when the two differ, checking the
+            # read path would append a duplicate on every call.
+            current_blacklist = _read_blacklist_file(blacklist_path)
             if asset_uid in current_blacklist:
                 # Update in-memory cache
                 if _STATIC_ASSET_BLACKLIST is not None:

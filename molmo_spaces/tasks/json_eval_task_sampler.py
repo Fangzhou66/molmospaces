@@ -62,7 +62,11 @@ from molmo_spaces.evaluation.benchmark_schema import (
 )
 from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
 from molmo_spaces.tasks.task import BaseMujocoTask
-from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler, get_static_asset_blacklist
+from molmo_spaces.tasks.task_sampler import (
+    BaseMujocoTaskSampler,
+    assert_asset_blacklist_pinned,
+    seal_asset_blacklist,
+)
 from molmo_spaces.utils.constants.simulation_constants import OBJAVERSE_FREE_JOINT_DEFAULT_DAMPING
 from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
@@ -190,12 +194,13 @@ def missing_object_pose_body_skip_reason(
     ):
         return "unselected place_receptacle candidate"
 
-    blacklist = static_asset_blacklist
-    if blacklist is None:
-        blacklist = get_static_asset_blacklist()
-    for uid in sorted(blacklist):
-        if uid and uid in body_name:
-            return f"static-blacklisted body ({uid})"
+    # DELIBERATELY unused. If a body the frozen episode names is absent because
+    # _delete_blacklisted_bodies removed it, the environment does not match the
+    # benchmark and the episode must NOT be scored: returning None makes the caller
+    # re-raise the KeyError, which is what upstream does (it has neither this
+    # function nor this branch). The parameter stays in the signature so the non-use
+    # is visible and existing call sites keep working.
+    del static_asset_blacklist
 
     return None
 
@@ -278,6 +283,12 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         # TODO(RMH): Add input arg for noise level (high, low, medium) to support noisy eval
         if exp_config.robot_config.action_noise_config is not None:
             exp_config.robot_config.action_noise_config.enabled = False
+
+        # Seal + pin BEFORE any scene is compiled, so (i) this process reads one
+        # fixed UID set and (ii) setup_robot_scene's mass/inertia handler can no
+        # longer append to the in-repo file mid-run from inside a scored eval.
+        self._sealed_asset_blacklist = seal_asset_blacklist()
+        assert_asset_blacklist_pinned()
 
         super().__init__(exp_config)
 

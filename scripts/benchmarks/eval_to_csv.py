@@ -1,13 +1,110 @@
 import os, json, tempfile
 import argparse
+import glob
+import re
+import sys
 import h5py
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
 from scipy.stats import beta as beta_dist
 import logging
 log = logging.getLogger(__name__)
+
+MANIFEST_NAME = "_MANIFEST.json"
+FAILED_DIR_NAME = "_FAILED"
+PARTIAL_SUFFIX = ".partial"
+
+
+class IncompleteEvalError(RuntimeError):
+    """The set of h5s on disk is not the set of episodes in the benchmark."""
+
+
+@dataclass(frozen=True)
+class CompletenessPolicy:
+    """How to treat a scored set that does not match the benchmark.
+
+    `expected_episodes` overrides the manifest; `allow_incomplete` downgrades the
+    refusal to a stderr warning plus `complete=False` in every CSV row.
+    """
+
+    expected_episodes: int | None = None
+    allow_incomplete: bool = False
+
+
+@dataclass
+class EpisodeSetReport:
+    """What is on disk versus what the benchmark says should be."""
+
+    expected: int | None
+    found: set = field(default_factory=set)
+    failed: list = field(default_factory=list)
+    partial: list = field(default_factory=list)
+    unreadable: list = field(default_factory=list)
+
+    @property
+    def missing(self) -> list:
+        if self.expected is None:
+            return []
+        return sorted(set(range(self.expected)) - self.found)
+
+    @property
+    def complete(self):
+        """True/False, or None when the expected set is unknown."""
+        if self.expected is None:
+            return None
+        return not (self.missing or self.failed or self.partial or self.unreadable)
+
+    def describe(self, run_path) -> str:
+        reasons = []
+        for marker in self.failed[:20]:
+            with open(marker) as fh:
+                reasons.append(f"  {os.path.basename(marker)}: {json.load(fh)['reason']}")
+        missing = self.missing
+        return (
+            f"INCOMPLETE eval under {run_path}: expected {self.expected} episodes, "
+            f"found {len(self.found)}.\n"
+            f"  missing indices ({len(missing)}): {missing[:20]}"
+            f"{' ...' if len(missing) > 20 else ''}\n"
+            f"  {FAILED_DIR_NAME} markers: {len(self.failed)}\n"
+            f"  {PARTIAL_SUFFIX} dirs:   {len(self.partial)}\n"
+            f"  unreadable h5s:  {len(self.unreadable)}\n"
+            + ("\n".join(reasons) if reasons else "")
+        )
+
+
+def _survey_episode_set(run_path, expected_episodes=None) -> EpisodeSetReport:
+    """Reconcile the published episode dirs against the benchmark's own count.
+
+    The denominator must come from the benchmark, not from whichever files happen
+    to exist. `_MANIFEST.json` is written by the MolmoSpaces adapter, which is the
+    only component that knows how many episodes the catalog holds.
+    """
+    manifest_path = os.path.join(run_path, MANIFEST_NAME)
+    manifest_n = None
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as fh:
+            manifest_n = int(json.load(fh)["num_episodes"])
+    if expected_episodes is not None and manifest_n is not None and expected_episodes != manifest_n:
+        raise IncompleteEvalError(
+            f"--expected-episodes {expected_episodes} disagrees with {manifest_path} "
+            f"({manifest_n})"
+        )
+
+    found = set()
+    for entry in Path(run_path).iterdir():
+        match = re.fullmatch(r"ep_(\d{6})", entry.name) if entry.is_dir() else None
+        if match:
+            found.add(int(match.group(1)))
+
+    return EpisodeSetReport(
+        expected=expected_episodes if expected_episodes is not None else manifest_n,
+        found=found,
+        failed=sorted(glob.glob(os.path.join(run_path, FAILED_DIR_NAME, "*.json"))),
+        partial=sorted(glob.glob(os.path.join(run_path, f"ep_*{PARTIAL_SUFFIX}"))),
+    )
 
 THOR_CAT_SIMPLIFY = {
     "saltshaker": "S/P Shaker", "peppershaker": "S/P Shaker",
@@ -97,9 +194,18 @@ def _episode_joint_jerk(ep, dt, max_steps=None):
     return float(np.mean(np.linalg.norm(d3, axis=1)))
 
 
-def _combine_trajectories(folder_path):
+def _combine_trajectories(folder_path, *, allow_incomplete=False):
+    """Merge the published per-episode h5s into one temp file.
+
+    Returns (combined_path, unreadable_paths).
+    """
     folder = Path(folder_path)
-    h5_files = sorted(folder.rglob("*.h5"))
+    # A crashed run leaves ep_NNNNNN.partial/ holding a half-written h5. Only the
+    # renamed directory is a verified artifact, so .partial is never scored.
+    h5_files = sorted(
+        p for p in folder.rglob("*.h5")
+        if not any(part.endswith(PARTIAL_SUFFIX) for part in p.parts)
+    )
     if not h5_files:
         raise FileNotFoundError(f"No .h5 found under {folder_path}")
 
@@ -107,6 +213,7 @@ def _combine_trajectories(folder_path):
     tmp.close()
     out = h5py.File(tmp.name, "w")
     ep = 0
+    unreadable = []
     for src_path in h5_files:
         try:
             src = h5py.File(src_path, "r")
@@ -116,10 +223,18 @@ def _combine_trajectories(folder_path):
                 ep += 1
             src.close()
         except Exception as e:
-            print(f"Warning: skipping {src_path}: {e}")
+            if not allow_incomplete:
+                out.close()
+                os.unlink(tmp.name)
+                raise IncompleteEvalError(
+                    f"unreadable trajectory h5 {src_path}: {e!r}; refusing to score a "
+                    f"partial set (pass --allow-incomplete to override)"
+                ) from e
+            unreadable.append(str(src_path))
+            print(f"Warning: skipping {src_path}: {e}", file=sys.stderr)
     out.close()
     print(f"Combined {ep} episodes from {len(h5_files)} files → {tmp.name}")
-    return tmp.name
+    return tmp.name, unreadable
 
 
 def _build_row(policy_name, category, s, t, jerk_list, report_both, oracle_s=0):
@@ -148,17 +263,48 @@ def _build_row(policy_name, category, s, t, jerk_list, report_both, oracle_s=0):
     return row, rate
 
 
+def _enforce_completeness(report, run_path, combined_h5, *, allow_incomplete):
+    """Refuse to emit a rate over a biased subset, or say loudly that it is one."""
+    if report.expected is None:
+        print(
+            "=" * 72 + "\n"
+            f"WARNING: no {MANIFEST_NAME} under {run_path} and no --expected-episodes.\n"
+            "         The success rate below is computed over the files that happen to\n"
+            "         exist, NOT over the benchmark. It cannot be trusted as a board "
+            "number.\n" + "=" * 72,
+            file=sys.stderr,
+        )
+        return
+    if report.complete:
+        return
+
+    message = report.describe(run_path)
+    if not allow_incomplete:
+        os.unlink(combined_h5)
+        raise IncompleteEvalError(
+            message + "\nRefusing to emit a success rate over a biased subset. "
+            "Pass --allow-incomplete to override."
+        )
+    print(message, file=sys.stderr)
+
+
 def eval_to_csv(
     run_path: str,
     policy_name: str,
     success_condition: str = "at-end",
     output_csv: str = "eval_results.csv",
     dt: float = 0.1,
-    max_steps: int | None = None
+    max_steps: int | None = None,
+    completeness: CompletenessPolicy = CompletenessPolicy(),
 ):
     report_both = success_condition == "both"
+    allow_incomplete = completeness.allow_incomplete
 
-    combined_h5 = _combine_trajectories(run_path)
+    report = _survey_episode_set(run_path, completeness.expected_episodes)
+    combined_h5, report.unreadable = _combine_trajectories(
+        run_path, allow_incomplete=allow_incomplete
+    )
+    _enforce_completeness(report, run_path, combined_h5, allow_incomplete=allow_incomplete)
     per_obj = defaultdict(lambda: {"success": 0, "oracle_success": 0, "total": 0, "jerk_joint": []})
     total_s, total_os, total_n = 0, 0, 0
     all_jerk_joint = []
@@ -183,7 +329,16 @@ def eval_to_csv(
                 else:
                     raise ValueError(f"Unknown success condition: {success_condition}")
             else:
-                log.info(f"Warning: no success array for {key}, skipping")
+                # This module configures no logging handler, so the log.info that
+                # used to sit here produced no output at all -- the episode left the
+                # denominator with no trace anywhere.
+                if not allow_incomplete:
+                    os.unlink(combined_h5)
+                    raise IncompleteEvalError(
+                        f"episode {key} has no `success` array; refusing to drop it "
+                        f"silently from the denominator (pass --allow-incomplete)"
+                    )
+                print(f"Warning: no success array for {key}, skipping", file=sys.stderr)
                 continue
 
             jj = _episode_joint_jerk(ep, dt, max_steps=max_steps)
@@ -209,6 +364,10 @@ def eval_to_csv(
                             d["jerk_joint"], report_both, d["oracle_success"])
         rows.append(row)
 
+    if total_n == 0 and not allow_incomplete:
+        os.unlink(combined_h5)
+        raise IncompleteEvalError(f"scored 0 episodes under {run_path}")
+
     overall_row, rate = _build_row(policy_name, "OVERALL", total_s, total_n,
                                    all_jerk_joint, report_both, total_os)
     rows.append(overall_row)
@@ -216,12 +375,25 @@ def eval_to_csv(
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    # The `complete` COLUMN, not only the `#` provenance lines, is the load-bearing
+    # half: any concat of these CSVs into a board sheet drops comment lines.
+    for row in rows:
+        row["complete"] = report.complete
+
     df = pd.DataFrame(rows)
     with open(output_csv, "w") as fout:
         fout.write(f"# policy_name: {policy_name}\n")
         fout.write(f"# run_path: {run_path}\n")
         fout.write(f"# dt: {dt}\n")
         fout.write(f"# max_steps: {max_steps}\n")
+        fout.write(f"# expected_episodes: {report.expected}\n")
+        fout.write(f"# scored_episodes: {total_n}\n")
+        if report.complete is not True:
+            fout.write(
+                f"# INCOMPLETE: {len(report.missing)} missing {report.missing[:20]} "
+                f"failed_markers={len(report.failed)} partial_dirs={len(report.partial)} "
+                f"unreadable={len(report.unreadable)}\n"
+            )
         df.to_csv(fout, index=False)
 
     summary = f"SR: {round(rate, 2)}%"
@@ -243,6 +415,11 @@ if __name__ == "__main__":
     parser.add_argument("--output-csv", default="eval_results.csv", help="Output CSV file (default: eval_results.csv)")
     parser.add_argument("--dt", type=float, default=67/1000, help="Time step [s] (default: 0.1)")
     parser.add_argument("--steps-per-episode", type=int, default=None, help="Max steps per episode (default: None)")
+    parser.add_argument("--expected-episodes", type=int, default=None,
+                        help=f"Benchmark episode count; overrides {MANIFEST_NAME}")
+    parser.add_argument("--allow-incomplete", action="store_true",
+                        help="Score a partial set anyway; stamps # INCOMPLETE and "
+                             "complete=False into the CSV")
 
     args = parser.parse_args()
 
@@ -254,4 +431,8 @@ if __name__ == "__main__":
         output_csv=args.output_csv,
         dt=args.dt,
         max_steps=args.steps_per_episode,
+        completeness=CompletenessPolicy(
+            expected_episodes=args.expected_episodes,
+            allow_incomplete=args.allow_incomplete,
+        ),
     )

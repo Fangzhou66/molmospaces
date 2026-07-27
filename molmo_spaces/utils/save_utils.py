@@ -45,6 +45,48 @@ def is_camera_sensor(sensor_name: str, sensor_suite: SensorSuite | None = None) 
             sensor, CameraParameterSensor
         )
 
+    if sensor_suite is None:
+        raise ValueError(
+            f"is_camera_sensor({sensor_name!r}) called without a SensorSuite. There is no "
+            "name-based fallback: the real camera names (e.g. "
+            "droid_shoulder_light_randomization) carry no 'camera' token, so a heuristic "
+            "would classify them as non-cameras. Pass the suite, or use "
+            "_image_like_entries for shape-based detection."
+        )
+
+    # Name is not a member of the suite: not a camera we know about.
+    return False
+
+
+def _tensor_nbytes(value) -> int:
+    """Byte size of a torch.Tensor or np.ndarray without assuming `.nbytes`."""
+    element_size = getattr(value, "element_size", None)
+    if callable(element_size):  # torch.Tensor
+        return int(element_size() * value.nelement())
+    return int(getattr(value, "nbytes", 0))
+
+
+def _image_like_entries(episode_data: dict) -> dict[str, tuple]:
+    """Top-level entries in a BATCHED episode dict that look like image streams.
+
+    Shape-based, not name-based: save_trajectories holds no SensorSuite, and the
+    "camera" substring test used elsewhere in this module misses 4 of the 5 real
+    scored camera names. Nested dicts are skipped -- CameraSensor.get_observation
+    returns an ndarray, never a dict.
+
+    Returns {name: (shape, nbytes)}.
+    """
+    found: dict[str, tuple] = {}
+    for name, value in episode_data.items():
+        if isinstance(value, dict) or name.endswith("_seg"):
+            continue
+        shape = getattr(value, "shape", None)
+        if shape is None or len(shape) not in (3, 4):
+            continue
+        if shape[1] >= 32 and shape[2] >= 32:
+            found[name] = (tuple(shape), _tensor_nbytes(value))
+    return found
+
 
 def byte_array_to_string(bytes_to_decode: np.ndarray):
     return bytes(bytes_to_decode).rstrip(b"\x00").decode("utf-8")
@@ -213,7 +255,7 @@ def prepare_episode_for_saving(
     save_dir: str | None = None,
     episode_idx: int = 0,
     save_file_suffix: str = "",
-    remove_sensors_if_save_dir: bool = True,
+    remove_camera_sensors: bool = True,
 ) -> dict[str, torch.Tensor] | None:
     """
     Transform raw episode history into batched format ready for save_trajectories().
@@ -233,7 +275,10 @@ def prepare_episode_for_saving(
         save_dir: Optional directory to save videos immediately (before batching)
         episode_idx: Episode index for video filenames
         save_file_suffix: Optional suffix for video filenames
-        remove_sensors_if_save_dir: remove camera-related sensors if video saved
+        remove_camera_sensors: drop camera/depth frames before batching. They are the
+            mp4 payload and are never an h5 field. When save_dir is None the frames
+            are discarded with no artifact anywhere -- that is the intent on the
+            scored eval path, which wants the h5 only.
 
     Returns:
         Dict[str, Tensor] with all data batched along time dimension, or None if no data
@@ -289,31 +334,33 @@ def prepare_episode_for_saving(
             sensor_suite=sensor_suite,
         )
 
-        if remove_sensors_if_save_dir:
-            # CRITICAL: Delete camera data (RGB and depth) from observations to avoid batching it
-            # This is where the massive memory savings come from
-            removed_sensors = set()
-            for obs in flattened_obs:
-                sensors_to_remove = []
-                for sensor_name in obs:
-                    # Check if this is a camera sensor (RGB or depth)
-                    # Skip segmentation sensors as they're not videos
-                    if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith(
-                        "_seg"
-                    ):
-                        sensors_to_remove.append(sensor_name)
+    # INVARIANT: camera/depth frames are the mp4 payload and are never an h5 field
+    # (_save_sensor_data_from_batched stores video-filename references only). This is
+    # independent of save_dir: a save_dir=None caller must not hand frames to
+    # save_trajectories either. Ordering matters -- stripping before
+    # batch_observations avoids an np.stack copy of 1.86 GiB/episode (5 cams,
+    # T=607, 352x624x3).
+    if remove_camera_sensors:
+        removed_sensors = set()
+        for obs in flattened_obs:
+            sensors_to_remove = []
+            for sensor_name in obs:
+                # Check if this is a camera sensor (RGB or depth)
+                # Skip segmentation sensors as they're not videos
+                if is_camera_sensor(sensor_name, sensor_suite) and not sensor_name.endswith("_seg"):
+                    sensors_to_remove.append(sensor_name)
 
-                # Remove camera data
-                for sensor_name in sensors_to_remove:
-                    obs.pop(sensor_name, None)
-                    removed_sensors.add(sensor_name)
+            # Remove camera data
+            for sensor_name in sensors_to_remove:
+                obs.pop(sensor_name, None)
+                removed_sensors.add(sensor_name)
 
-            if removed_sensors:
-                log.debug(
-                    f"Removed camera sensors from observations before batching: {removed_sensors}"
-                )
+        if removed_sensors:
+            log.debug(
+                f"Removed camera sensors from observations before batching: {removed_sensors}"
+            )
 
-        gc.collect()
+    gc.collect()
 
     # Batch observations: List[Dict] -> Dict[str, Tensor(T, ...)]
     # Note: Camera images already removed if save_dir was provided, so this is much smaller
@@ -603,6 +650,23 @@ def save_trajectories(
     # Save HDF5 file
     hdf5_path = os.path.join(save_dir, f"trajectories{save_file_suffix}.h5")
 
+    # Refuse to write image tensors into an h5. Checked BEFORE the file is
+    # opened, so a violation cannot leave a truncated or multi-GiB artifact.
+    # Covers every caller and every episode -- unlike the save_mp4s-gated,
+    # suite-less check that used to sit at the end of this function.
+    for _ep_idx, _ep in enumerate(episodes_data):
+        _offenders = _image_like_entries(_ep)
+        if _offenders:
+            _mib = sum(nb for _, nb in _offenders.values()) / 2**20
+            _shapes = {k: v[0] for k, v in _offenders.items()}
+            raise RuntimeError(
+                f"Refusing to write image tensors into {hdf5_path} "
+                f"(episode {_ep_idx}): {_shapes} would add {_mib:.1f} MiB. Camera frames "
+                f"are the mp4 payload, not an h5 field. Call "
+                f"prepare_episode_for_saving(...) with remove_camera_sensors=True and a "
+                f"sensor_suite that covers them."
+            )
+
     with h5py.File(hdf5_path, "w") as hdf5_file:
         for episode_idx, episode_data in enumerate(episodes_data):
             episode_group = hdf5_file.create_group(f"traj_{episode_idx}")
@@ -688,21 +752,10 @@ def save_trajectories(
     logger.info(f"Saved {len(episodes_data)} episodes to: {os.path.abspath(save_dir)}")
     # logger.info(f"  HDF5 file: {hdf5_path}")
 
-    # Videos should have been saved during prepare_episode_for_saving() before batching
-    # This is required for memory optimization - camera data is removed before batching
+    # Camera-absence is enforced by _image_like_entries before the file is opened,
+    # for every caller and every episode -- not here, where it would run only under
+    # save_mp4s and only for episodes_data[0].
     if save_mp4s:
-        if len(episodes_data) > 0:
-            # Verify that camera data was removed (indicates videos were already saved)
-            first_episode = episodes_data[0]
-            camera_sensors_in_batch = [s for s in first_episode if is_camera_sensor(s)]
-
-            if camera_sensors_in_batch:
-                raise RuntimeError(
-                    f"Camera data still present in batched episodes: {camera_sensors_in_batch}. "
-                    f"Videos must be saved via save_videos_from_raw_observations() before batching. "
-                    f"Pass save_dir to prepare_episode_for_saving() to enable this."
-                )
-
         logger.debug("Videos were saved during prepare_episode_for_saving() (before batching)")
     return Path(hdf5_path)
 
