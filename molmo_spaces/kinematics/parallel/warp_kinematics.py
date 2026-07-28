@@ -152,7 +152,7 @@ def mask_jacobian(
     i = wp.tid()
     for j in range(3):
         for k in range(nv):
-            J[i, j, k] = J[i, j, k] * float(mask[i, k])
+            J[i, j, k] = J[i, j, k] * wp.float32(mask[i, k])
 
 
 mat66f = wp.types.matrix(shape=(6, 6), dtype=wp.float32)
@@ -166,7 +166,7 @@ def cholesky_solve6(H: mat66f, b: vec6f) -> vec6f:
     L = mat66f()
     for i in range(6):
         for j in range(i + 1):
-            s = float(0.0)
+            s = wp.float32(0.0)
             for k in range(j):
                 s += L[i, k] * L[j, k]
             if i == j:
@@ -177,7 +177,7 @@ def cholesky_solve6(H: mat66f, b: vec6f) -> vec6f:
     # Forward substitution: L @ y = b
     y = vec6f()
     for i in range(6):
-        s = float(0.0)
+        s = wp.float32(0.0)
         for k in range(i):
             s += L[i, k] * y[k]
         y[i] = (b[i] - s) / L[i, i]
@@ -185,7 +185,7 @@ def cholesky_solve6(H: mat66f, b: vec6f) -> vec6f:
     # Backward substitution: L^T @ x = y
     x = vec6f()
     for i in range(5, -1, -1):
-        s = float(0.0)
+        s = wp.float32(0.0)
         for k in range(i + 1, 6):
             s += L[k, i] * x[k]
         x[i] = (y[i] - s) / L[i, i]
@@ -223,7 +223,7 @@ def lm_step(
     H = mat66f()
     for a in range(6):
         for b in range(6):
-            val = float(0.0)
+            val = wp.float32(0.0)
             for k in range(nv):
                 Ja = jacp[i, a, k] if a < 3 else jacr[i, a - 3, k]
                 Jb = jacp[i, b, k] if b < 3 else jacr[i, b - 3, k]
@@ -237,7 +237,7 @@ def lm_step(
 
     # q_dot = J^T @ x, dq = q_dot * dt
     for k in range(nv):
-        val = float(0.0)
+        val = wp.float32(0.0)
         for a in range(3):
             val += jacp[i, a, k] * x[a]
             val += jacr[i, a, k] * x[a + 3]
@@ -395,7 +395,12 @@ class SimpleWarpKinematics(ParallelKinematics):
 
         qpos_arr = self._dicts_to_qpos_arr(qpos_dicts)
         with wp.ScopedDevice(self._device):
-            wp.copy(data.qpos, wp.from_numpy(qpos_arr))
+            # NOTE: dtype= is required. Without it, wp.from_numpy infers a *vector* dtype for a
+            # 2D array (shape (B, nq) -> B elements of vec{nq}f), whose element size (4*nq bytes)
+            # no longer matches data.qpos's float32 elements. warp <=1.14 only compared total
+            # byte counts so the raw memcpy happened to be correct; warp 1.15 added an element-size
+            # equality check to wp.copy and now raises "Incompatible array data types".
+            wp.copy(data.qpos, wp.from_numpy(qpos_arr, dtype=wp.float32))
             mjw.fwd_position(self._mjw_model, data)
 
         dol = {}
@@ -612,13 +617,17 @@ class SimpleWarpKinematics(ParallelKinematics):
             ik_args.leaf_frame_type.fill_(leaf_frame_type.value)
             ik_args.damping.fill_(damping)
             ik_args.dt.fill_(dt)
+            # NOTE: dtype= is required on both of these; see the comment in forward_kinematics.
             wp.copy(
                 ik_args.jacobian_mask,
-                wp.from_numpy(self._create_jacobian_mask(batch_size, unlocked_move_group_ids)),
+                wp.from_numpy(
+                    self._create_jacobian_mask(batch_size, unlocked_move_group_ids),
+                    dtype=wp.int32,
+                ),
             )
 
             q0_arr = self._dicts_to_qpos_arr(q0_dicts)
-            wp.copy(data.qpos, wp.from_numpy(q0_arr))
+            wp.copy(data.qpos, wp.from_numpy(q0_arr, dtype=wp.float32))
 
             for i in range(max_iter):
                 if self._device.startswith("cuda"):
