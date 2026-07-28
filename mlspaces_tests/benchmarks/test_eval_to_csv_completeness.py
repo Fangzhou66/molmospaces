@@ -49,9 +49,7 @@ def _write_episode(run_dir: Path, index: int, *, success: bool = False) -> Path:
         arr[-1] = success
         traj.create_dataset("success", data=arr)
         traj.create_dataset("obs_scene", data=json.dumps({"object_name": "apple_01"}))
-        traj.create_group("obs").create_group("agent").create_dataset(
-            "qpos", data=_qpos_rows(T)
-        )
+        traj.create_group("obs").create_group("agent").create_dataset("qpos", data=_qpos_rows(T))
     return path
 
 
@@ -223,3 +221,48 @@ def test_no_temp_files_leak_on_refusal(run_dir, tmp_path):
 
     leaked = [n for n in set(os.listdir(tmp_root)) - before if n.endswith(".h5")]
     assert leaked == []
+
+
+def test_scored_count_must_reach_expected(run_dir, tmp_path):
+    """complete=True must not sit on a short denominator.
+
+    Every expected ep_NNNNNN/ exists, but one publishes a traj group the scorer cannot
+    count. Before the fix the filesystem survey saw 3/3 and reported complete=True.
+    """
+    _write_manifest(run_dir, 3)
+    for i in range(2):
+        _write_episode(run_dir, i)
+    ep_dir = run_dir / "ep_000002"
+    ep_dir.mkdir()
+    with h5py.File(ep_dir / "trajectories_000002.h5", "w") as fh:
+        fh.create_group("not_a_traj_group")
+
+    with pytest.raises(IncompleteEvalError):
+        eval_to_csv(str(run_dir), "col9", output_csv=str(tmp_path / "results.csv"))
+
+
+def test_failure_evidence_without_manifest_still_refuses(run_dir, tmp_path):
+    """A _FAILED marker means an episode is KNOWN lost, manifest or not.
+
+    Before the fix the expected-is-None branch returned above this check, so a run with
+    durable failure evidence and no manifest exited 0 with a clean-looking rate.
+    """
+    for i in range(3):
+        _write_episode(run_dir, i)
+    failed = run_dir / "_FAILED"
+    failed.mkdir()
+    (failed / "ep_000003.json").write_text(
+        json.dumps({"episode_index": 3, "reason": "OSError(28, 'No space left')"})
+    )
+
+    with pytest.raises(IncompleteEvalError, match="known lost"):
+        eval_to_csv(str(run_dir), "col9", output_csv=str(tmp_path / "results.csv"))
+
+    # --allow-incomplete still downgrades it to a loud warning.
+    df = eval_to_csv(
+        str(run_dir),
+        "col9",
+        output_csv=str(tmp_path / "r2.csv"),
+        completeness=CompletenessPolicy(allow_incomplete=True),
+    )
+    assert df[df["category"] == "OVERALL"].iloc[0]["total"] == 3

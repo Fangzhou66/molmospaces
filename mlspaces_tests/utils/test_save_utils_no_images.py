@@ -57,8 +57,7 @@ def _history(n_cams: int) -> dict:
     observations = []
     for t in range(T):
         obs = {
-            name: np.full((height, width, 3), t, dtype=np.uint8)
-            for name in SCORED_CAMERAS[:n_cams]
+            name: np.full((height, width, 3), t, dtype=np.uint8) for name in SCORED_CAMERAS[:n_cams]
         }
         obs["qpos"] = np.arange(9, dtype=np.float32) + t
         obs["tcp_pose"] = np.arange(7, dtype=np.float32) + t
@@ -166,8 +165,15 @@ def test_strip_is_independent_of_save_dir():
     """The frames leave the observation dicts whether or not videos were written."""
     without = prepare_episode_for_saving(_history(5), _suite(5), fps=10.0, save_dir=None)
     assert without is not None
-    assert set(without) == {"qpos", "tcp_pose", "rewards", "terminals", "truncateds",
-                            "successes", "obs_scene"}
+    assert set(without) == {
+        "qpos",
+        "tcp_pose",
+        "rewards",
+        "terminals",
+        "truncateds",
+        "successes",
+        "obs_scene",
+    }
 
 
 def test_prepare_episode_for_saving_keeps_frames_when_opted_out():

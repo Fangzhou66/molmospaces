@@ -43,6 +43,11 @@ class EpisodeSetReport:
     failed: list = field(default_factory=list)
     partial: list = field(default_factory=list)
     unreadable: list = field(default_factory=list)
+    # Episodes the scorer actually counted. Distinct from len(found): a published
+    # ep_NNNNNN/ can still contribute no scored episode (empty traj group, a copy
+    # that aborted mid-merge). Without this, `complete` could be True over a short
+    # denominator -- the exact defect this class exists to prevent.
+    scored: int | None = None
 
     @property
     def missing(self) -> list:
@@ -55,7 +60,11 @@ class EpisodeSetReport:
         """True/False, or None when the expected set is unknown."""
         if self.expected is None:
             return None
-        return not (self.missing or self.failed or self.partial or self.unreadable)
+        if self.missing or self.failed or self.partial or self.unreadable:
+            return False
+        # The scored count must reach the benchmark's count, not merely the count of
+        # directories on disk.
+        return self.scored is None or self.scored == self.expected
 
     def describe(self, run_path) -> str:
         reasons = []
@@ -218,8 +227,17 @@ def _combine_trajectories(folder_path, *, allow_incomplete=False):
         try:
             src = h5py.File(src_path, "r")
             for tk in [k for k in src.keys() if k.startswith("traj_")]:
-                dst = out.create_group(f"episode_{ep:04d}_{tk}")
-                _copy_group(src[tk], dst)
+                name = f"episode_{ep:04d}_{tk}"
+                dst = out.create_group(name)
+                try:
+                    _copy_group(src[tk], dst)
+                except Exception:
+                    # A copy that dies partway leaves a half-populated group AND an
+                    # unincremented counter, so the next file collides on the same name
+                    # and every later file is skipped -- silently truncating the
+                    # denominator forward-only. Drop the stub so the name is free.
+                    del out[name]
+                    raise
                 ep += 1
             src.close()
         except Exception as e:
@@ -344,6 +362,23 @@ def _score_combined(combined_h5, opts) -> Tally:
 
 def _enforce_completeness(report, run_path, *, allow_incomplete):
     """Refuse to emit a rate over a biased subset, or say loudly that it is one."""
+    # Durable failure evidence is decisive even without a manifest: a _FAILED marker or
+    # a .partial dir means an episode is KNOWN lost. Checking this before the
+    # expected-is-None early return, which otherwise let such a run exit 0.
+    if not report.expected and (report.failed or report.partial or report.unreadable):
+        message = (
+            f"INCOMPLETE eval under {run_path}: no {MANIFEST_NAME}, but durable failure "
+            f"evidence is present -- {len(report.failed)} {FAILED_DIR_NAME} marker(s), "
+            f"{len(report.partial)} {PARTIAL_SUFFIX} dir(s), "
+            f"{len(report.unreadable)} unreadable h5(s). Episodes are known lost."
+        )
+        if not allow_incomplete:
+            raise IncompleteEvalError(
+                message + "\nRefusing to emit a success rate. Pass --allow-incomplete "
+                "to override."
+            )
+        print(message, file=sys.stderr)
+
     if report.expected is None:
         print(
             "=" * 72 + "\n"
@@ -393,6 +428,11 @@ def eval_to_csv(
             allow_incomplete=allow_incomplete,
         )
         tally = _score_combined(combined_h5, opts)
+        # Re-check with the SCORED count known. The pre-scoring pass can only see the
+        # filesystem; only now can "every expected episode actually contributed a
+        # scored trajectory" be enforced.
+        report.scored = tally.total_n
+        _enforce_completeness(report, run_path, allow_incomplete=allow_incomplete)
 
         rows = []
         for obj in sorted(tally.per_obj):
