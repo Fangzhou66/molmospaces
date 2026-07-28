@@ -53,3 +53,8 @@ mlspaces_tests/**/test_data
 # pytest
 .pytest_cache/
 __pycache__/
+
+# local build + workflow scratch dirs (2026-07-27)
+build*/
+.syntaxcheck/
+wf[0-9A-Z]*/

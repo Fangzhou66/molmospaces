@@ -114,7 +114,16 @@ environments = [
     "sys_platform == 'darwin'",
     "sys_platform == 'linux'",
 ]
-extra-index-url = ["https://pypi.org/simple", "https://test.pypi.org/simple/"]
+# test.pypi.org dropped: uv gives extra indexes HIGHER priority than the
+# default, and the last one wins, so listing test.pypi here made it the
+# primary index for EVERY dependency. Under uv's default first-match strategy
+# that resolves boto3 to the test.pypi stub (1.4.0 < the required 1.35.0) and
+# the install has no solution; under --index-strategy unsafe-best-match it
+# instead picks test.pypi's scipy 1.17.1 sdist and dies building it without
+# OpenBLAS. The only reason test.pypi was here was molmospaces-resources,
+# which is now published on pypi (0.0.1b4 wheel present), so plain pypi
+# resolves the whole tree.
+extra-index-url = ["https://pypi.org/simple"]
 
 [tool.uv.sources]
 bpy = { index = "bpy" }
