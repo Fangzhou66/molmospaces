@@ -100,6 +100,255 @@ def _log_texture_cache_potential(model: mj.MjModel) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# Render-service mjb content key (B1, 2026-07-27)
+# --------------------------------------------------------------------------
+# The mjb transport below is a *content-addressed, write-once* cache: the key
+# names a file in a shared (often NFS) directory, and the writer skips the
+# save entirely when a file of that name already exists. Under the render
+# service that mjb is the ONLY channel by which model appearance reaches the
+# server -- per-frame we ship mjSTATE_INTEGRATION plus the derived kinematics
+# blob (xpos/xmat/light_xpos/light_xdir), and nothing else. So anything the
+# server's mjv_updateScene/filament reads out of mjModel and that is NOT in
+# this key is silently frozen at whatever the first writer of that filename
+# happened to have.
+#
+# The original key covered qpos0, body_pos, geom_pos, geom_size, tex_adr and
+# mesh_vertadr only. MolmoSpaces randomizes appearance per episode
+# (TextureRandomizer writes geom_rgba/mat_rgba/tex_data, LightingRandomizer
+# writes light_pos/dir/diffuse/specular/ambient/active), and *none* of that
+# moved the key: two models differing only in appearance produced the same
+# filename, the stale mjb was reused, and the observation kept the previous
+# appearance. col11_color -- whose whole discriminative signal is object
+# colour -- was training on frozen colours.
+#
+# Note tex_adr/mesh_vertadr are *offset* tables: they pin texture and mesh
+# LAYOUT but say nothing about texture pixels or vertex positions. They are
+# not a proxy for content and were never sufficient.
+#
+# Design decisions, and what was rejected:
+#
+#  * Rejected: hashing `mj_saveModel(model, None, buf)` output, i.e. keying on
+#    the exact bytes we are about to write. It is complete by construction and
+#    tempting for that reason, but it forces a transient host allocation of
+#    mj_sizeModel bytes (528MB for the canary-8757 scenes) on EVERY env
+#    creation including cache hits, times however many engine workers share
+#    the node. The current miss path streams straight to the FILE* and never
+#    materialises that buffer; we are not introducing a multi-GB allocation
+#    spike to compute a cache key.
+#
+#  * Rejected: a shape+dtype+strided-sample digest of tex_data. Texture
+#    randomization here frequently rewrites a texture with a *procedurally
+#    regular* bitmap (checkers, gradients, solid fills, see
+#    randomization/texture.py) -- exactly the content class where a fixed
+#    stride is most likely to land on identical samples across two different
+#    textures. Trading a correctness hole that is invisible in every metric
+#    for ~0.5s is the trade that produced this bug in the first place.
+#
+#  * Rejected: hashing only on texture-swap events (a dirty flag). The key is
+#    computed in a process that does not own the randomizers, and a shared
+#    NFS cache is written by processes that never observe each other's
+#    events. A content key has to be a pure function of content.
+#
+#  * Accepted: hash tex_data (and mesh_vert/mesh_face/...) in full, in place,
+#    zero-copy through the buffer protocol. Measured end-to-end on this box
+#    (192MB of 2048^2 textures, whole signature): 214ms, i.e. ~895 MB/s, so
+#    the 528MB canary worst case costs ~0.6s. This key is computed
+#    once per MjFilamentRenderer construction, i.e. once per *scene load*, not
+#    per episode and not per frame -- and a scene load that misses costs 30-70s
+#    of cold build. ~1% of a cold build to make the key sound is not a
+#    trade-off worth agonising over.
+#
+# Fields are hashed with an explicit name/dtype/shape tag so that no two
+# fields can alias by byte-shifting into each other, and the tuple is a fixed
+# sorted literal -- no dict iteration, no id(), no Python hash(), so the key
+# is stable across processes and interpreter restarts.
+_SIG_GEOMETRY_FIELDS: tuple[str, ...] = (
+    "body_pos",
+    # body_quat/geom_quat were missing alongside the *_pos fields: two scenes
+    # differing only by an object's rotation hashed identically.
+    "body_quat",
+    "geom_dataid",
+    "geom_group",
+    "geom_pos",
+    "geom_quat",
+    "geom_size",
+    "geom_type",
+    "hfield_data",
+    # mesh_vertadr alone only pins the offset table; the vertices/faces/
+    # normals/texcoords are the actual rendered geometry.
+    "mesh_face",
+    "mesh_faceadr",
+    "mesh_normal",
+    "mesh_texcoord",
+    "mesh_vert",
+    "mesh_vertadr",
+    "qpos0",
+    # Sites are drawn (sitegroup is zeroed for our scene option, but the
+    # server builds its own scene) and cameras resolve model-side when the
+    # legacy non-GLCAM arm is in use.
+    "cam_fovy",
+    "cam_pos",
+    "cam_quat",
+    "site_pos",
+    "site_quat",
+    "site_size",
+    "site_type",
+)
+
+# Everything the renderer reads that carries *appearance*. Names verified
+# against the installed mujoco 3.7.1 mjModel (3.7 splits lighting into the
+# classic ambient/diffuse/specular/attenuation/cutoff/exponent set plus the
+# newer physical set: type/intensity/range/bulbradius/texid).
+_SIG_APPEARANCE_FIELDS: tuple[str, ...] = (
+    "flex_matid",
+    "flex_rgba",
+    "geom_matid",
+    "geom_rgba",
+    "light_active",
+    "light_ambient",
+    "light_attenuation",
+    "light_bodyid",
+    "light_bulbradius",
+    "light_castshadow",
+    "light_cutoff",
+    "light_diffuse",
+    "light_dir",
+    "light_dir0",
+    "light_exponent",
+    "light_intensity",
+    "light_mode",
+    "light_pos",
+    "light_pos0",
+    "light_poscom0",
+    "light_range",
+    "light_specular",
+    "light_targetbodyid",
+    "light_texid",
+    "light_type",
+    "mat_emission",
+    "mat_metallic",
+    "mat_reflectance",
+    "mat_rgba",
+    "mat_roughness",
+    "mat_shininess",
+    "mat_specular",
+    "mat_texid",
+    "mat_texrepeat",
+    "mat_texuniform",
+    # numeric_data carries FILAMENT_ATTR_ENV_LIGHT_INTENSITY -- the filament
+    # renderer's environment light is a custom numeric baked into the model by
+    # TaskSampler.setup_robot_scene, so it is appearance, not metadata.
+    "numeric_adr",
+    "numeric_data",
+    "numeric_size",
+    "site_matid",
+    "site_rgba",
+    "skin_matid",
+    "skin_rgba",
+    "tendon_matid",
+    "tendon_rgba",
+    "tex_adr",
+    "tex_colorspace",
+    "tex_data",
+    "tex_height",
+    "tex_nchannel",
+    "tex_pathadr",
+    "tex_type",
+    "tex_width",
+)
+
+# Kept separate only because they are C structs rather than arrays; walked
+# recursively below. `vis` holds the headlight colours, global fovy, shadow
+# quality and znear/zfar; `stat.extent` scales znear/zfar. All appearance.
+_SIG_STRUCT_FIELDS: tuple[str, ...] = ("stat", "vis")
+
+# names/paths resolve texture and mesh file references (see _texture_key,
+# which prefers a path over a content digest) and name-index every object the
+# server looks up. Small, so hashed wholesale.
+_SIG_BLOB_FIELDS: tuple[str, ...] = ("names", "paths")
+
+_SIG_ARRAY_FIELDS: tuple[str, ...] = tuple(
+    sorted(_SIG_GEOMETRY_FIELDS + _SIG_APPEARANCE_FIELDS)
+)
+
+
+def _sig_update_array(h, tag: str, value) -> None:
+    """Hash one mjModel array under a self-describing tag.
+
+    ``np.ascontiguousarray`` is a no-op for mjModel fields (they are C
+    contiguous views straight into the model struct), so the big ones
+    (tex_data, mesh_vert) stream through the buffer protocol with no copy --
+    and, because they are *views*, we necessarily hash the array's current
+    contents rather than any snapshot taken at construction time.
+    """
+    arr = np.ascontiguousarray(value)
+    h.update(f"|{tag}|{arr.dtype.str}|{arr.shape}|".encode())
+    if arr.ndim == 0 or arr.dtype.kind in "SU":
+        h.update(arr.tobytes())
+    else:
+        h.update(arr)
+
+
+def _sig_update_struct(h, tag: str, obj) -> None:
+    """Recursively hash an mjModel sub-struct (MjVisual, MjStatistic, ...).
+
+    ``sorted(dir(obj))`` is deterministic across processes; nested structs
+    (vis.headlight, vis.global_, ...) recurse. Attribute names starting with
+    an uppercase letter are the pybind11 *type* handles that mujoco exposes
+    alongside the instances (``MjVisual.Headlight``) and are skipped.
+    """
+    for name in sorted(n for n in dir(obj) if not n.startswith("_") and not n[0].isupper()):
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if isinstance(value, (int, float, bool)):
+            _sig_update_array(h, f"{tag}.{name}", np.asarray(value, dtype=np.float64))
+        elif isinstance(value, np.ndarray):
+            _sig_update_array(h, f"{tag}.{name}", value)
+        else:
+            _sig_update_struct(h, f"{tag}.{name}", value)
+
+
+def render_model_signature(model: mj.MjModel, digest_size: int = 16) -> str:
+    """Content key for "may the render service reuse a previously saved mjb?".
+
+    Covers geometry AND appearance; see the block comment above for what is in
+    it and why. Pure function of the model's current contents, hence stable
+    across processes -- do not introduce ``id()``, ``hash()`` or dict
+    iteration here.
+    """
+    h = hashlib.blake2b(digest_size=digest_size)
+    # mj_sizeModel separates models whose size classes differ even before any
+    # field content is compared; cheap and a useful first discriminator.
+    h.update(b"|nsize|")
+    h.update(np.int64(mj.mj_sizeModel(model)).tobytes())
+    for name in _SIG_ARRAY_FIELDS:
+        value = getattr(model, name, None)
+        if value is None:
+            # Field dropped/renamed by a mujoco upgrade. Hash the absence so
+            # the key at least changes shape, and shout: silently narrowing
+            # the key is how B1 happened. tests/test_filament_render_signature
+            # .py has a guard that fails when a new appearance field appears.
+            h.update(f"|{name}|ABSENT|".encode())
+            log.warning(
+                "render_model_signature: mjModel has no field %r (mujoco %s); "
+                "the mjb content key no longer covers it",
+                name,
+                getattr(mj, "__version__", "?"),
+            )
+            continue
+        _sig_update_array(h, name, value)
+    for name in _SIG_STRUCT_FIELDS:
+        _sig_update_struct(h, name, getattr(model, name))
+    for name in _SIG_BLOB_FIELDS:
+        _sig_update_array(h, name, np.asarray(getattr(model, name)))
+    return h.hexdigest()
+
+
 def prepare_locals_for_super(
     local_vars, args_name="args", kwargs_name="kwargs", ignore_kwargs=False
 ):
@@ -176,18 +425,29 @@ class MjFilamentRenderer(MjAbstractRenderer):
                     # byte-identical 528MB mjb; the synchronized rebuild wave was
                     # a 16GB NFS burst -> 300s+ resets -> mass engine quarantine).
                     # Same key => same file => the server can skip reloading too.
-                    import hashlib as _hl
-
-                    _h = _hl.blake2b(digest_size=8)
-                    _h.update(np.int64(mj.mj_sizeModel(model)).tobytes())
-                    for _arr in (
-                        model.qpos0, model.body_pos, model.geom_pos,
-                        model.geom_size, model.tex_adr, model.mesh_vertadr,
-                    ):
-                        _h.update(np.ascontiguousarray(_arr).tobytes())
-                    mjb_path = os.path.join(
-                        mjb_dir, f"rsvc_sig_{_h.hexdigest()}.mjb"
+                    #
+                    # The key MUST cover appearance, not just geometry -- under
+                    # the service this file is the only appearance transport
+                    # there is. See render_model_signature() for the full
+                    # rationale (B1, 2026-07-27).
+                    #
+                    # Filename prefix bumped sig -> sig2 deliberately: every
+                    # rsvc_sig_*.mjb already sitting in a shared MJB_DIR was
+                    # written under the geometry-only key and may hold the
+                    # appearance of whichever episode happened to write it
+                    # first. Those files must NOT be reused, and renaming the
+                    # namespace retires them without a migration step.
+                    _sig_t0 = time.monotonic()
+                    _sig = render_model_signature(model)
+                    log.info(
+                        "MS_FILAMENT_MJB_SIG_TIMING sig=%s hash_s=%.3f "
+                        "model_mb=%.1f ntex=%d",
+                        _sig,
+                        time.monotonic() - _sig_t0,
+                        mj.mj_sizeModel(model) / (1024 * 1024),
+                        int(model.ntex),
                     )
+                    mjb_path = os.path.join(mjb_dir, f"rsvc_sig2_{_sig}.mjb")
                     if not os.path.exists(mjb_path):
                         _tmp = f"{mjb_path}.tmp.{os.getpid()}"
                         mj.mj_saveModel(model, _tmp, None)
@@ -248,6 +508,21 @@ class MjFilamentRenderer(MjAbstractRenderer):
             self._mjr_context = None
             self._depth_rendering = False
             self._segmentation_rendering = False
+            # KNOWN GAP (B1 follow-up, 2026-07-27, NOT fixed here). The local
+            # path refreshes appearance per episode: mjv_updateScene re-reads
+            # geom_rgba/mat_*/light_* off the live model every frame, and
+            # task_sampler calls mark_textures_dirty() after texture
+            # randomization so render() re-uploads. The service path has
+            # neither: the server holds its own model, loaded once from the
+            # mjb at init_model() time, and per frame we send only state +
+            # derived kinematics. So a randomizer that mutates appearance
+            # AFTER this constructor -- which is all of them, init_scene()
+            # and randomize_scene() both run after env creation -- never
+            # reaches the server at all. Widening the mjb content key (see
+            # render_model_signature) makes the *cache* sound; it does not
+            # create the missing appearance channel. Fixing that needs an
+            # appearance-upload message in the protocol, or a re-init when the
+            # signature changes, and is deliberately out of scope here.
             self._textures_need_upload = False
             log.info(
                 "MS_RENDER_SERVICE active (slot %s): local MjrContext skipped",
