@@ -237,8 +237,14 @@ def test_scored_count_must_reach_expected(run_dir, tmp_path):
     with h5py.File(ep_dir / "trajectories_000002.h5", "w") as fh:
         fh.create_group("not_a_traj_group")
 
-    with pytest.raises(IncompleteEvalError):
+    with pytest.raises(IncompleteEvalError) as excinfo:
         eval_to_csv(str(run_dir), "col9", output_csv=str(tmp_path / "results.csv"))
+
+    # A refusal must name its reason. Every other counter reads zero here, so without
+    # the scored count the operator sees "nothing is wrong" followed by a refusal.
+    message = str(excinfo.value)
+    assert "scored 2" in message
+    assert "contributed no scored trajectory" in message
 
 
 def test_failure_evidence_without_manifest_still_refuses(run_dir, tmp_path):

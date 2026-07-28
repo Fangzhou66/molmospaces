@@ -72,10 +72,22 @@ class EpisodeSetReport:
             with open(marker) as fh:
                 reasons.append(f"  {os.path.basename(marker)}: {json.load(fh)['reason']}")
         missing = self.missing
+        # The scored count is the ONLY thing that explains a refusal where every
+        # other counter reads zero (published dirs that contribute no trajectory).
+        # Without it the operator sees "nothing is wrong" followed by a refusal.
+        scored_line = ""
+        if self.scored is not None and self.scored != self.expected:
+            scored_line = (
+                f"  scored episodes: {self.scored} of {self.expected} EXPECTED "
+                f"<-- the discrepancy: {len(self.found)} directories are published but "
+                f"{self.expected - self.scored} contributed no scored trajectory\n"
+            )
         return (
             f"INCOMPLETE eval under {run_path}: expected {self.expected} episodes, "
-            f"found {len(self.found)}.\n"
-            f"  missing indices ({len(missing)}): {missing[:20]}"
+            f"found {len(self.found)}, scored "
+            f"{self.scored if self.scored is not None else 'n/a'}.\n"
+            + scored_line
+            + f"  missing indices ({len(missing)}): {missing[:20]}"
             f"{' ...' if len(missing) > 20 else ''}\n"
             f"  {FAILED_DIR_NAME} markers: {len(self.failed)}\n"
             f"  {PARTIAL_SUFFIX} dirs:   {len(self.partial)}\n"
@@ -360,7 +372,7 @@ def _score_combined(combined_h5, opts) -> Tally:
     return tally
 
 
-def _enforce_completeness(report, run_path, *, allow_incomplete):
+def _enforce_completeness(report, run_path, *, allow_incomplete, announce=True):
     """Refuse to emit a rate over a biased subset, or say loudly that it is one."""
     # Durable failure evidence is decisive even without a manifest: a _FAILED marker or
     # a .partial dir means an episode is KNOWN lost. Checking this before the
@@ -377,9 +389,12 @@ def _enforce_completeness(report, run_path, *, allow_incomplete):
                 message + "\nRefusing to emit a success rate. Pass --allow-incomplete "
                 "to override."
             )
-        print(message, file=sys.stderr)
+        if announce:
+            print(message, file=sys.stderr)
 
     if report.expected is None:
+        if not announce:
+            return
         print(
             "=" * 72 + "\n"
             f"WARNING: no {MANIFEST_NAME} under {run_path} and no --expected-episodes.\n"
@@ -420,7 +435,12 @@ def eval_to_csv(
     # try/finally, not bare unlinks: every refusal path below raises, and so can
     # _episode_joint_jerk on a corrupt qpos row. The temp file must go regardless.
     try:
-        _enforce_completeness(report, run_path, allow_incomplete=allow_incomplete)
+        # Fail fast on filesystem evidence before spending the scoring pass.
+        # announce=False: the post-scoring call owns the operator-facing output,
+        # otherwise every banner prints twice.
+        _enforce_completeness(
+            report, run_path, allow_incomplete=allow_incomplete, announce=False
+        )
         opts = ScoringOptions(
             success_condition=success_condition,
             dt=dt,
