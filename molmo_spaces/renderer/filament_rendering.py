@@ -22,6 +22,16 @@ import os as _os
 # Gated on MS_RENDER_KEEP_CAMERAS so DEFAULT / RL behaviour stays byte-identical
 # to upstream (double read); only diet datagen workers drop the duplicate.
 _MS_RENDER_DIET = _os.environ.get("MS_RENDER_KEEP_CAMERAS") is not None
+# MS_RGB_SINGLE_READ drops ONLY the duplicate second readPixels (the frames
+# are byte-identical: same buffer, same viewport, nothing in between) and
+# deliberately does NOT imply camera pruning the way _MS_RENDER_DIET does.
+# Under the filament shim each readPixels is a FULL Vulkan frame, so the
+# duplicate is 2 of the ~6 frames per chunk (2026-07-29 plan U2). Default OFF
+# = upstream parity; flip only in an A/B arm AFTER the dup-audit gate reads
+# dup_frames >= 1e5 with dup_mismatch == 0 (render_meter, ALICE_MS_RGB_DUP_AUDIT).
+_MS_RGB_SINGLE_READ = (
+    _os.environ.get("MS_RGB_SINGLE_READ") == "1" or _MS_RENDER_DIET
+)
 log = logging.getLogger(__name__)
 
 _PROCESS_TEXTURE_KEYS: set[str] = set()
@@ -531,7 +541,7 @@ class MjFilamentRenderer(MjAbstractRenderer):
             np.copyto(self._scene.flags, original_flags)
         else:
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
-            if not _MS_RENDER_DIET:
+            if not _MS_RGB_SINGLE_READ:
                 mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
 
         return out
@@ -592,7 +602,7 @@ class MjFilamentRenderer(MjAbstractRenderer):
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
         else:
             mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
-            if not _MS_RENDER_DIET:
+            if not _MS_RGB_SINGLE_READ:
                 mj.mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
 
         return out
