@@ -209,7 +209,11 @@ def _legacy_filament_context_creation_lock(label: str = "mjr_context"):
         "gpu": gpu,
         "path": lock_path,
         "label": label,
-        "namespace": {"free_drain_enabled": False},
+        # path/gpu MUST ride in the namespace: filament_context_free_lock keys its
+        # slot files on namespace["path"] and falls back to the UNSHARDED global
+        # lock when absent -- which silently made FREE_CONCURRENCY=K mean "K total"
+        # instead of "K per GPU" at any multi-env-GPU density (2026-07-29 audit A7).
+        "namespace": {"free_drain_enabled": False, "path": lock_path, "gpu": gpu},
     }
 
     try:
