@@ -35,6 +35,12 @@ _MS_RGB_SINGLE_READ = (
 log = logging.getLogger(__name__)
 
 _PROCESS_TEXTURE_KEYS: set[str] = set()
+# 4 bytes = 8 hex chars per key. At the ~10k distinct textures this campaign
+# plausibly reaches, expected collisions are ~1e-2, well under the resolution
+# of the 50%/80% dedup thresholds the union feeds.
+_TEXTURE_FP_BYTES = 4
+# Defensive line cap; a normal rebuild contributes ~70 new keys.
+_TEXTURE_KEY_LOG_CAP = 200
 
 
 def _model_cstring(chars, start: int) -> str:
@@ -73,6 +79,47 @@ def _texture_key(model: mj.MjModel, tex_id: int) -> tuple[str, int]:
     )
 
 
+def _texture_fingerprint(key: str) -> str:
+    """Short content-deterministic id for one texture key.
+
+    A digest of the WHOLE key, not a prefix of it. Both key forms open with a
+    long constant head -- "path:/…" and "data:type=N:colorspace=N:shape=…" --
+    so a literal 8-character prefix would map every path-keyed texture onto one
+    id and every data-keyed one onto another. The number this instrument exists
+    to produce is a cross-engine UNION, and collapsing distinct textures shrinks
+    the union, i.e. inflates the apparent dedup ceiling that decides D1. Hashing
+    the key keeps the ids uniform and independent instead.
+
+    Deterministic across processes: blake2b of the key text, and the key itself
+    is either the asset path or a blake2b of the pixel bytes.
+    """
+    return hashlib.blake2b(key.encode("utf-8"), digest_size=_TEXTURE_FP_BYTES).hexdigest()
+
+
+def _log_new_texture_keys(new_unique: set[str]) -> None:
+    """Emit this rebuild's NEW content keys, so the union is a parser set-union.
+
+    Sorted, which buys two things: the same content emits the same line in every
+    process, and an over-cap rebuild emits its LOWEST fingerprints rather than an
+    arbitrary subset. Since the fingerprints are uniform hashes, that low region
+    is the same deterministic sample of the key space in every engine, so a
+    truncated line still contributes a comparable slice to the union instead of
+    noise. ``new_unique`` vs ``emitted`` tells the parser when that happened.
+    """
+    if not new_unique:
+        return
+    fingerprints = sorted(_texture_fingerprint(key) for key in new_unique)
+    emitted = fingerprints[:_TEXTURE_KEY_LOG_CAP]
+    log.info(
+        "MS_FILAMENT_TEXTURE_CACHE_KEYS pid=%d new_unique=%d emitted=%d keys=%s%s",
+        os.getpid(),
+        len(fingerprints),
+        len(emitted),
+        ",".join(emitted),
+        " truncated" if len(emitted) < len(fingerprints) else "",
+    )
+
+
 def _log_texture_cache_potential(model: mj.MjModel) -> None:
     if os.environ.get("ALICE_MS_FIL_TEXTURE_CACHE_LOG", "1").lower() in (
         "0",
@@ -91,7 +138,10 @@ def _log_texture_cache_potential(model: mj.MjModel) -> None:
 
     unique_keys = set(keys)
     hits = sum(1 for key in keys if key in _PROCESS_TEXTURE_KEYS)
-    misses = len(unique_keys - _PROCESS_TEXTURE_KEYS)
+    # Kept as a set, not just its length: these are the keys this rebuild adds
+    # to the process, i.e. exactly what the cross-engine union is built from.
+    new_unique = unique_keys - _PROCESS_TEXTURE_KEYS
+    misses = len(new_unique)
     _PROCESS_TEXTURE_KEYS.update(unique_keys)
     hit_rate = hits / len(keys) if keys else 0.0
     log.info(
@@ -108,6 +158,7 @@ def _log_texture_cache_potential(model: mj.MjModel) -> None:
         hit_rate,
         total_bytes / (1024 * 1024),
     )
+    _log_new_texture_keys(new_unique)
 
 
 def prepare_locals_for_super(
