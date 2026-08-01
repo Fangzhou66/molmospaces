@@ -14,6 +14,7 @@ Action Noise:
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,37 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+# ALICE_MS_OBS_HISTORY_LITE=1: stop RETAINING the observation history tail.
+#
+# observation_cache holds the full per-step observation INCLUDING rendered
+# frames, and it grows monotonically for the whole episode.
+#
+# SIZE IS POSTURE-DEPENDENT AND CURRENTLY UNMEASURED. The "~150-300MB/episode"
+# figure in close() predates ALICE_MS_RENDER_LAST_ONLY going on in production
+# (2026-07-27): under that posture only 1-in-8 task.steps carries frames, so
+# the retained bytes are far lower and have not been measured. Do not quote
+# the old number as a current-posture fact.
+#
+# The justification for this limiter does NOT rest on the size: in the alice
+# rollout path the retained tail has ZERO CONSUMERS, which is airtight and
+# posture-independent. Its only consumers are:
+#   * task.py step(), which reads and may overwrite element [0] ONLY, and only
+#     on the first step (the reset-vs-first-step camera check);
+#   * get_history(), reached from molmo_spaces data_generation and from alice's
+#     _dump_episode_h5(), which no-ops unless h5_out_dir is set.
+# Verified by reading every reference in the repo: there is no [-1], no
+# "latest", and no slicing anywhere, so a bounded deque is unnecessary --
+# element [0] is the entire consumed set.
+#
+# Retention-only. The observation object is still built and returned to callers
+# unchanged; the only externally visible effects are RSS and GC timing.
+_OBS_HISTORY_LITE_ENV = "ALICE_MS_OBS_HISTORY_LITE"
+_obs_lite_receipt_logged = False
+
+
+def _obs_history_lite_enabled() -> bool:
+    return os.environ.get(_OBS_HISTORY_LITE_ENV) == "1"
 
 
 class BaseMujocoTask(ABC):
@@ -77,6 +109,23 @@ class BaseMujocoTask(ABC):
         self.terminal_cache: list[list[bool]] = []
         self.truncated_cache: list[list[bool]] = []
         self.success_cache: list[list[bool]] = []
+
+        # Resolved once per task: the retention limiter must not change mid
+        # episode, or [0] could be the only element for part of a run.
+        self._obs_history_lite = _obs_history_lite_enabled()
+        global _obs_lite_receipt_logged
+        if not _obs_lite_receipt_logged:
+            # ARM RECEIPT, BOTH DIRECTIONS, once per process (a task is built
+            # per episode; 64 engines give 64 lines, matching RENDER_METER).
+            # Absence of a line is not a receipt -- an off arm has to be able
+            # to prove it was off, not merely fail to prove it was on.
+            log.info(
+                "OBS_HISTORY_LITE %s",
+                "enabled: retaining observation[0] only"
+                if self._obs_history_lite
+                else "disabled: full observation history retained",
+            )
+            _obs_lite_receipt_logged = True
 
         # Policy completion tracking
         self._policy_done = False
@@ -202,7 +251,14 @@ class BaseMujocoTask(ABC):
         success = np.full(terminated.shape, fill_value=self.judge_success())
 
         # cache the inputs and outputs
-        self.observation_cache.append(observation)
+        if self._obs_history_lite and self.observation_cache:
+            # Retention-only: [0] is already seeded by reset() and is the sole
+            # element any consumer reads (step()'s first-step camera check).
+            # `observation` itself is returned to the caller untouched below,
+            # so nothing downstream can tell the difference except RSS.
+            pass
+        else:
+            self.observation_cache.append(observation)
         self.reward_cache.append(reward)
         self.terminal_cache.append(terminated)
         self.truncated_cache.append(truncated)
@@ -453,6 +509,18 @@ class BaseMujocoTask(ABC):
         return obs_scene
 
     def get_history(self) -> dict:
+        if self._obs_history_lite:
+            # Never silently hand back a truncated history. alice's
+            # _dump_episode_h5 is guarded (it disables the flag whenever
+            # h5_out_dir is set), so reaching here means some OTHER consumer
+            # -- e.g. the data_generation pipeline -- wants a history the
+            # limiter did not keep.
+            log.warning(
+                "get_history() called with %s=1: observations contain only "
+                "element [0]; rewards/actions/terminals are complete. Unset "
+                "the flag for any path that consumes the observation history.",
+                _OBS_HISTORY_LITE_ENV,
+            )
         history = dict(
             observations=self.observation_cache,
             rewards=self.reward_cache,
